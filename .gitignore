@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# MuJoCo / runtime artifacts
+MUJOCO_LOG.TXT
+*.log
+mujoco_videos/
+
+# Training outputs (live on the 5090, not in the repo)
+train_5090/.venv/
+train_5090/checkpoints/
+*.mp4
+*.npz
+*.pkl
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent/session transcripts (kept out of version control)
+claude_chat.txt

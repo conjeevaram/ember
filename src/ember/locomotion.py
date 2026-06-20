@@ -1,0 +1,490 @@
+"""Unitree G1 12-DOF RL walker with a kinematic full-body arm overlay.
+
+Physics: Unitree's pretrained 12-DOF lower-body locomotion policy
+(``deploy/pre_train/g1/motion.pt``) in a plain MuJoCo sim. Its command vector is
+exactly ``(vx, vy, yaw_rate)``, so velocity control reduces to writing that
+vector -- see :meth:`G1Sim.set_command` / :func:`send_velocity_command`.
+
+Arms: the 12-DOF model's arms are welded decoration, so for rendering we drive a
+full 29-DOF (with hands) body whose base + 12 legs are copied from the physics
+sim every frame, with the arms posed kinematically (carry hose / aim). This
+gives an articulated, posable upper body on top of the bulletproof walker -- no
+extra physics, no retraining. The analytic fire-aim later sets the arm pose
+exactly, which is ideal (no PD tracking error).
+
+Run:
+    python -m ember.locomotion --scene obstacles
+    ember-walk --scene obstacles            # if installed
+
+Programmatic (for the fire controller):
+    from ember import locomotion
+    locomotion.start(block=False, scene="obstacles")
+    locomotion.send_velocity_command(vx=0.5, yaw=0.2)
+    state = locomotion.get_state()
+"""
+from __future__ import annotations
+
+import threading
+import time
+
+import mujoco
+import numpy as np
+import torch
+import yaml
+
+from . import arms, scenes
+from .config import (DEPLOY_CONFIG_PATH, G1_MODEL_DIR, POLICY_PATH, RENDER_FPS,
+                     RENDER_H, RENDER_W, VX_RANGE, VY_RANGE, YAW_RANGE, clamp,
+                     gravity_orientation, quat_yaw)
+from .streaming import FrameBuffer, create_app, encode_jpeg, serve
+
+# 12-DOF physics scenes, and their matching 29-DOF render-overlay scenes.
+SCENES = {
+    "flat": str(G1_MODEL_DIR / scenes.FLAT_12),
+    "obstacles": str(G1_MODEL_DIR / scenes.OBSTACLES_12),
+}
+OVERLAY_SCENES = {
+    SCENES["flat"]: str(G1_MODEL_DIR / scenes.FLAT_29),
+    SCENES["obstacles"]: str(G1_MODEL_DIR / scenes.OBSTACLES_29),
+}
+
+# The 12 leg joints, in the order the policy/config expect. The policy is
+# indexed by these (by name), so it works on any G1 model layout.
+LEG_JOINTS = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+]
+
+
+def pd_control(target_q, q, kp, target_dq, dq, kd):
+    return (target_q - q) * kp + (target_dq - dq) * kd
+
+
+class G1Sim:
+    """12-DOF locomotion sim + kinematic full-body render overlay."""
+
+    def __init__(self, scene_path: str | None = None, overlay_scene: str | None = None):
+        self.scene_path = scene_path or SCENES["flat"]
+        self.overlay_scene = overlay_scene
+
+        with open(DEPLOY_CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f)
+        self.sim_dt = cfg["simulation_dt"]                  # 0.002 -> 500 Hz
+        self.control_decimation = cfg["control_decimation"]  # 10 -> 50 Hz policy
+        self.kps = np.array(cfg["kps"], dtype=np.float32)
+        self.kds = np.array(cfg["kds"], dtype=np.float32)
+        self.default_angles = np.array(cfg["default_angles"], dtype=np.float32)
+        self.ang_vel_scale = cfg["ang_vel_scale"]
+        self.dof_pos_scale = cfg["dof_pos_scale"]
+        self.dof_vel_scale = cfg["dof_vel_scale"]
+        self.action_scale = cfg["action_scale"]
+        self.cmd_scale = np.array(cfg["cmd_scale"], dtype=np.float32)
+        self.num_actions = cfg["num_actions"]
+        self.num_obs = cfg["num_obs"]
+
+        # Live control state.
+        self.cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # vx, vy, yaw
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.obs = np.zeros(self.num_obs, dtype=np.float32)
+        self.target_dof_pos = self.default_angles.copy()
+        self.counter = 0
+        self._fell = False
+
+        # MuJoCo physics model (12-DOF).
+        self.model = mujoco.MjModel.from_xml_path(self.scene_path)
+        self.model.opt.timestep = self.sim_dt
+        self.data = mujoco.MjData(self.model)
+        self._build_leg_maps()
+
+        self._spawn_qpos = self.data.qpos.copy()
+        self._spawn_qpos[self.leg_qadr] = self.default_angles
+        self._reset_state()
+        mujoco.mj_forward(self.model, self.data)
+
+        # Demo loop: snap back to start on a fall or after clearing the course.
+        self.auto_reset = False
+        self.reset_x = 6.5
+
+        # Heading-hold: outer P loop keeping the robot straight along y=0 facing
+        # +x (the blind policy curves otherwise). Same machinery later steers
+        # toward a fire. Manual A/D overrides it.
+        self.heading_hold = False
+        self.heading_target = 0.0
+        self.lateral_target = 0.0
+        self._manual_yaw = False
+
+        torch.set_num_threads(1)  # tiny MLP; keep it off the sim/render threads
+        self.policy = torch.jit.load(str(POLICY_PATH))
+        self.policy.eval()
+
+        # Rendering (model/renderer created lazily in the render thread).
+        self.render_model = None
+        self.render_data = None
+        self._render_maps_built = False
+        self.overlay_arm_pose_name = "carry"
+        self.renderer = None
+        self.cam = mujoco.MjvCamera()
+        self.cam.distance = 3.0
+        self.cam.elevation = -15.0
+        self.cam.azimuth = 135.0
+
+        self.frames = FrameBuffer()
+        self._cmd_lock = threading.Lock()
+        self._running = False
+
+    # -- public control API ------------------------------------------------- #
+    def set_command(self, vx=None, vy=None, yaw=None):
+        with self._cmd_lock:
+            if vx is not None:
+                self.cmd[0] = clamp(vx, *VX_RANGE)
+            if vy is not None:
+                self.cmd[1] = clamp(vy, *VY_RANGE)
+            if yaw is not None:
+                # A manual yaw input takes over from heading-hold so the user
+                # can steer; set_heading_hold re-enables auto-steer.
+                self._manual_yaw = True
+                self.cmd[2] = clamp(yaw, *YAW_RANGE)
+            return self.cmd.copy()
+
+    def set_heading_hold(self, on=True):
+        self.heading_hold = on
+        self._manual_yaw = not on
+        return on
+
+    def set_overlay_arm_pose(self, name):
+        """Pose the overlay arms: 'carry' (hold hose), 'aim', or 'down'."""
+        if name in arms.ARM_POSES:
+            self.overlay_arm_pose_name = name
+        return self.overlay_arm_pose_name
+
+    def get_state(self):
+        """Pelvis pose/vel (world frame) + command + fallen flag + arm pose."""
+        return {
+            "pos": self.data.qpos[0:3].copy(),
+            "quat": self.data.qpos[3:7].copy(),
+            "lin_vel": self.data.qvel[0:3].copy(),
+            "ang_vel": self.data.qvel[3:6].copy(),
+            "cmd": self.cmd.copy(),
+            "fell": self._fell,
+            "sim_time": self.data.time,
+            "arm_pose": self.overlay_arm_pose_name if self.overlay_scene else None,
+        }
+
+    # -- joint maps & policy ------------------------------------------------- #
+    def _build_leg_maps(self):
+        m = self.model
+        JNT, ACT = mujoco.mjtObj.mjOBJ_JOINT, mujoco.mjtObj.mjOBJ_ACTUATOR
+        nid = lambda obj, n: mujoco.mj_name2id(m, obj, n)
+        self.leg_qadr = np.array([m.jnt_qposadr[nid(JNT, n)] for n in LEG_JOINTS])
+        self.leg_vadr = np.array([m.jnt_dofadr[nid(JNT, n)] for n in LEG_JOINTS])
+        self.leg_act = np.array([nid(ACT, n) for n in LEG_JOINTS])
+
+    def _compute_action(self):
+        q = self.data.qpos[self.leg_qadr]
+        dq = self.data.qvel[self.leg_vadr]
+        quat = self.data.qpos[3:7]
+        omega = self.data.qvel[3:6]
+
+        qj = (q - self.default_angles) * self.dof_pos_scale
+        dqj = dq * self.dof_vel_scale
+        grav = gravity_orientation(quat)
+        omega = omega * self.ang_vel_scale
+
+        period = 0.8
+        t = self.counter * self.sim_dt
+        phase = (t % period) / period
+        sin_phase, cos_phase = np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)
+
+        with self._cmd_lock:
+            cmd = self.cmd.copy()
+
+        n = self.num_actions
+        self.obs[:3] = omega
+        self.obs[3:6] = grav
+        self.obs[6:9] = cmd * self.cmd_scale
+        self.obs[9:9 + n] = qj
+        self.obs[9 + n:9 + 2 * n] = dqj
+        self.obs[9 + 2 * n:9 + 3 * n] = self.action
+        self.obs[9 + 3 * n:9 + 3 * n + 2] = [sin_phase, cos_phase]
+
+        with torch.no_grad():
+            obs_t = torch.from_numpy(self.obs).unsqueeze(0)
+            self.action = self.policy(obs_t).detach().numpy().squeeze()
+        self.target_dof_pos = self.action * self.action_scale + self.default_angles
+
+    # -- kinematic full-body render overlay ---------------------------------- #
+    def _build_render_maps(self):
+        """Index the overlay body's legs/arms. Runs in the render thread."""
+        m = self.render_model
+        JNT = mujoco.mjtObj.mjOBJ_JOINT
+        nid = lambda n: mujoco.mj_name2id(m, JNT, n)
+        self._render_leg_qadr = np.array([m.jnt_qposadr[nid(n)] for n in LEG_JOINTS])
+        leg_set = set(LEG_JOINTS)
+        self._render_aux_names, qadr = [], []
+        for i in range(m.njnt):
+            if m.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            name = mujoco.mj_id2name(m, JNT, i)
+            if name in leg_set:
+                continue
+            self._render_aux_names.append(name)
+            qadr.append(m.jnt_qposadr[i])
+        self._render_aux_qadr = np.array(qadr, dtype=int)
+        self._render_maps_built = True
+
+    def render_once(self):
+        """Render the current frame to the shared frame buffer. Must run on the
+        thread that owns the GL context (see :meth:`run`)."""
+        if self.overlay_scene:
+            if self.render_model is None:
+                self.render_model = mujoco.MjModel.from_xml_path(self.overlay_scene)
+                self.render_model.vis.global_.offwidth = RENDER_W
+                self.render_model.vis.global_.offheight = RENDER_H
+                self.render_data = mujoco.MjData(self.render_model)
+                self._build_render_maps()
+                self.renderer = mujoco.Renderer(self.render_model, RENDER_H, RENDER_W)
+            rd = self.render_data
+            # Drive the overlay body from physics: base + legs copied, arms posed.
+            rd.qpos[0:7] = self.data.qpos[0:7]
+            rd.qpos[self._render_leg_qadr] = self.data.qpos[self.leg_qadr]
+            targets = arms.resolve_pose(self.overlay_arm_pose_name, self._render_aux_names)
+            for name, adr in zip(self._render_aux_names, self._render_aux_qadr):
+                rd.qpos[adr] = targets[name]
+            mujoco.mj_forward(self.render_model, rd)
+            self.cam.lookat[:] = rd.qpos[0:3]
+            self.renderer.update_scene(rd, self.cam)
+        else:
+            if self.renderer is None:
+                self.renderer = mujoco.Renderer(self.model, RENDER_H, RENDER_W)
+            self.cam.lookat[:] = self.data.qpos[0:3]
+            self.renderer.update_scene(self.data, self.cam)
+        self.frames.set(encode_jpeg(self.renderer.render()))
+
+    def _render_loop(self):
+        interval = 1.0 / RENDER_FPS
+        while self._running:
+            t0 = time.time()
+            try:
+                self.render_once()
+            except Exception as e:  # a render hiccup must not kill the demo
+                print("render error:", e)
+            sleep = interval - (time.time() - t0)
+            if sleep > 0:
+                time.sleep(sleep)
+
+    # -- main loop ----------------------------------------------------------- #
+    def run(self, render=True):
+        """Blocking physics loop: 500 Hz sim, 50 Hz policy, paced to real time.
+        Rendering runs on its own thread with its own GL context."""
+        self._running = True
+        if render:
+            threading.Thread(target=self._render_loop, daemon=True).start()
+        dec = self.control_decimation
+        try:
+            while self._running:
+                tick_start = time.time()
+                for _ in range(dec):
+                    leg_tau = pd_control(
+                        self.target_dof_pos, self.data.qpos[self.leg_qadr],
+                        self.kps, np.zeros_like(self.kds),
+                        self.data.qvel[self.leg_vadr], self.kds,
+                    )
+                    self.data.ctrl[self.leg_act] = leg_tau
+                    mujoco.mj_step(self.model, self.data)
+                    self.counter += 1
+
+                if self.heading_hold and not self._manual_yaw:
+                    self.cmd[2] = self._steer()
+                self._compute_action()
+                self._fell = self.data.qpos[2] < 0.4
+
+                if self.auto_reset and (self._fell or self.data.qpos[0] > self.reset_x):
+                    time.sleep(0.4)
+                    self._reset_state()
+
+                sleep = dec * self.sim_dt - (time.time() - tick_start)
+                if sleep > 0:
+                    time.sleep(sleep)
+        finally:
+            self._running = False
+
+    def _steer(self):
+        """Yaw rate driving heading->heading_target and y->lateral_target."""
+        yaw = quat_yaw(self.data.qpos[3:7])
+        heading_err = np.arctan2(np.sin(self.heading_target - yaw),
+                                 np.cos(self.heading_target - yaw))
+        lateral_err = self.lateral_target - self.data.qpos[1]
+        return clamp(1.8 * heading_err + 0.9 * lateral_err, *YAW_RANGE)
+
+    def _reset_state(self):
+        self.data.qpos[:] = self._spawn_qpos
+        self.data.qvel[:] = 0.0
+        self.data.ctrl[:] = 0.0
+        self.action[:] = 0.0
+        self.target_dof_pos = self.default_angles.copy()
+        self.counter = 0
+        self._fell = False
+        mujoco.mj_forward(self.model, self.data)
+
+    def stop(self):
+        self._running = False
+
+
+# --------------------------------------------------------------------------- #
+# Module-level singleton + simple API (for the fire controller)
+# --------------------------------------------------------------------------- #
+_SIM: G1Sim | None = None
+
+
+def get_sim(scene_path=None, overlay_scene=None) -> G1Sim:
+    global _SIM
+    if _SIM is None:
+        _SIM = G1Sim(scene_path=scene_path, overlay_scene=overlay_scene)
+    return _SIM
+
+
+def send_velocity_command(vx=None, vy=None, yaw=None):
+    """Set the robot's commanded body velocity. vx/vy in m/s, yaw in rad/s.
+    Any arg left None is unchanged. Returns the (clamped) active command."""
+    return get_sim().set_command(vx=vx, vy=vy, yaw=yaw)
+
+
+def get_state():
+    return get_sim().get_state()
+
+
+# --------------------------------------------------------------------------- #
+# Web viewer
+# --------------------------------------------------------------------------- #
+_PAGE = """<!doctype html><html><head><title>G1 Walk</title>
+<style>body{background:#111;color:#ddd;font-family:monospace;margin:0;text-align:center}
+img{max-width:100%;height:auto;background:#000}
+#hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px}
+kbd{background:#333;padding:1px 5px;border-radius:3px}</style></head>
+<body>
+<div id="hud">
+<b>G1 locomotion</b> (12-DOF walker + kinematic arm overlay)<br>
+<kbd>W</kbd>/<kbd>S</kbd> fwd/back &nbsp; <kbd>A</kbd>/<kbd>D</kbd> turn<br>
+<kbd>Q</kbd>/<kbd>E</kbd> strafe &nbsp; <kbd>Space</kbd> stop<br>
+<kbd>H</kbd> auto-steer (re-center) <span id="hh"></span><br>
+<kbd>1</kbd> carry hose &nbsp; <kbd>2</kbd> aim &nbsp; <kbd>3</kbd> arms down &nbsp; arms: <span id="arm">?</span><br>
+cmd: <span id="cmd">0,0,0</span><br>
+<span id="st"></span>
+</div>
+<img src="/stream"/>
+<script>
+let vx=0,vy=0,yaw=0;
+function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json()).then(d=>{
+  document.getElementById('cmd').textContent=d.cmd.map(x=>x.toFixed(2)).join(', ');});}
+function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
+  document.getElementById('arm').textContent=d.arm_pose;});}
+document.addEventListener('keydown',e=>{
+  if(e.repeat)return;
+  switch(e.key.toLowerCase()){
+    case'w':vx=0.8;break; case's':vx=-0.4;break;
+    case'a':yaw=0.6;break; case'd':yaw=-0.6;break;
+    case'q':vy=0.3;break;  case'e':vy=-0.3;break;
+    case' ':vx=vy=yaw=0;break;
+    case'h':fetch('/heading?on=1').then(r=>r.json()).then(d=>{
+      document.getElementById('hh').textContent=d.heading_hold?'[ON]':'[off]';});return;
+    case'1':setArm('carry');return; case'2':setArm('aim');return;
+    case'3':setArm('down');return;
+    default:return;}
+  send();});
+document.addEventListener('keyup',e=>{
+  switch(e.key.toLowerCase()){
+    case'w':case's':vx=0;break;
+    case'a':case'd':yaw=0;break;
+    case'q':case'e':vy=0;break; default:return;}
+  send();});
+setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
+  if(d.arm_pose)document.getElementById('arm').textContent=d.arm_pose;
+  document.getElementById('st').textContent=
+    `pos ${d.pos.map(x=>x.toFixed(2))} ${d.fell?'\u26a0 FELL':'ok'}`;});},500);
+</script></body></html>"""
+
+
+def _make_app(sim: G1Sim):
+    from flask import jsonify, request
+
+    def register(app):
+        @app.route("/cmd")
+        def cmd():
+            def f(name):
+                v = request.args.get(name)
+                return float(v) if v is not None else None
+            c = sim.set_command(vx=f("vx"), vy=f("vy"), yaw=f("yaw"))
+            return jsonify(cmd=c.tolist())
+
+        @app.route("/heading")
+        def heading():
+            on = request.args.get("on", "1") not in ("0", "false", "")
+            sim.set_heading_hold(on)
+            return jsonify(heading_hold=on)
+
+        @app.route("/arm")
+        def arm():
+            return jsonify(arm_pose=sim.set_overlay_arm_pose(
+                request.args.get("pose", "carry")))
+
+    def state_fn():
+        s = sim.get_state()
+        return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
+                    fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
+                    arm_pose=s["arm_pose"])
+
+    return create_app(page_html=_PAGE, frame_buffer=sim.frames,
+                      state_fn=state_fn, register_routes=register)
+
+
+def start(block=True, serve_web=True, port=8088, render=True, initial_cmd=None,
+          scene="flat", loop=False, overlay=True):
+    """Start the sim. With block=False, runs the loop on a background thread."""
+    scenes.ensure_scenes()
+    scene_path = SCENES.get(scene, scene)
+    overlay_scene = OVERLAY_SCENES.get(scene_path) if overlay else None
+    sim = get_sim(scene_path=scene_path, overlay_scene=overlay_scene)
+    sim.auto_reset = loop
+    sim.heading_hold = loop
+    if initial_cmd is not None:
+        sim.set_command(*initial_cmd)
+
+    if serve_web:
+        serve(_make_app(sim), port, label="G1 walker")
+
+    if block:
+        sim.run(render=render)
+    else:
+        threading.Thread(target=lambda: sim.run(render=render), daemon=True).start()
+    return sim
+
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--scene", default="flat", help="flat | obstacles | <path.xml>")
+    p.add_argument("--idle", action="store_true",
+                   help="stand still until commanded (default: walk forward)")
+    p.add_argument("--vx", type=float, default=None, help="initial forward speed")
+    p.add_argument("--port", type=int, default=8088)
+    p.add_argument("--loop", dest="loop", action="store_true", default=None,
+                   help="auto-reset & replay (default: on for obstacles)")
+    p.add_argument("--no-loop", dest="loop", action="store_false")
+    p.add_argument("--no-overlay", dest="overlay", action="store_false", default=True,
+                   help="render the bare 12-DOF body (no arms)")
+    args = p.parse_args()
+
+    default_vx = 0.4 if args.scene == "obstacles" else 0.5
+    vx = 0.0 if args.idle else (args.vx if args.vx is not None else default_vx)
+    loop = (args.scene == "obstacles") if args.loop is None else args.loop
+    start(block=True, serve_web=True, port=args.port,
+          initial_cmd=(vx, 0.0, 0.0), scene=args.scene, loop=loop,
+          overlay=args.overlay)
+
+
+if __name__ == "__main__":
+    main()

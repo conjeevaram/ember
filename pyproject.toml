@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ember"
+version = "0.1.0"
+description = "Firefighting humanoid (Unitree G1) locomotion + whole-body demos in MuJoCo, streamed headlessly to a browser."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mujoco>=3.2",
+    "numpy>=1.24",
+    "torch>=2.2",        # CPU build is fine; the policies are small MLPs
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+    "flask>=3.0",
+]
+
+[project.optional-dependencies]
+# Whole-body motion-tracking demo (GMT). Its weights/assets live in $GMT_ROOT.
+gmt = ["tqdm>=4.66"]
+
+[project.scripts]
+ember-walk = "ember.locomotion:main"
+ember-gmt = "ember.gmt:main"
+ember-build-scenes = "ember.scenes:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
