@@ -119,12 +119,16 @@ def _terrain_slope(terrain: TerrainSpec, wx: float, wy: float,
 class Costmap:
     """Occupancy grid for A*; walls inflated by robot radius. Debris are traversable."""
 
-    def __init__(self, occupied: np.ndarray, xmin: float, ymin: float, res: float):
+    def __init__(self, occupied: np.ndarray, xmin: float, ymin: float, res: float,
+                 walls: tuple[tuple[float, float, float, float, float], ...] = ()):
         self.occupied = occupied
         self.xmin = xmin
         self.ymin = ymin
         self.res = res
         self.shape = occupied.shape  # (ny, nx)
+        # Raw (un-inflated) wall footprints, kept for the thin water-jet
+        # line-of-sight check (the inflated grid would over-reject grazing shots).
+        self.walls = tuple(walls)
 
     @classmethod
     def from_spec(cls, spec: SceneSpec, res: float = NAV_RES,
@@ -150,7 +154,7 @@ class Costmap:
                     wx = xmin + (i + 0.5) * res
                     if _terrain_slope(t, wx, wy, spec.bounds, res) > TERRAIN_MAX_SLOPE:
                         grid[j, i] = True
-        return cls(grid, xmin, ymin, res)
+        return cls(grid, xmin, ymin, res, walls=spec.walls)
 
     def world_to_cell(self, x: float, y: float) -> tuple[int, int]:
         return world_to_cell(x, y, self.xmin, self.ymin, self.res)
@@ -247,8 +251,13 @@ def safe_spray_point(costmap: Costmap, target_fire: tuple[float, float],
     if target_idx is None:
         target_idx = next((i for i, p in enumerate(fires) if p[0] == fx and p[1] == fy), -1)
     start = from_xy
-    best: tuple[float, float] | None = None
-    best_len = float("inf")
+    # Track the best candidate with a clear shot at the fire separately from the
+    # best overall: a clear shot always wins, but if no angle has one we still
+    # fall back to the shortest reachable point rather than failing outright.
+    best_clear: tuple[float, float] | None = None
+    best_clear_len = float("inf")
+    best_any: tuple[float, float] | None = None
+    best_any_len = float("inf")
     for gx, gy in _standoff_candidates(fx, fy, from_xy[0], from_xy[1], standoff):
         if not costmap.is_free_world(gx, gy):
             continue
@@ -261,30 +270,14 @@ def safe_spray_point(costmap: Costmap, target_fire: tuple[float, float],
             continue
         plen = sum(math.hypot(path[k + 1][0] - path[k][0], path[k + 1][1] - path[k][1])
                    for k in range(len(path) - 1))
-        if plen < best_len or (plen == best_len and (best is None or (gx, gy) < best)):
-            best_len = plen
-            best = (gx, gy)
-    return best
-
-
-def best_standoff(costmap: Costmap, fx: float, fy: float, from_x: float, from_y: float,
-                  standoff: float = SPRAY_STANDOFF) -> tuple[float, float] | None:
-    """Free, A*-reachable standoff point; shortest path wins (deterministic tie-break)."""
-    start = (from_x, from_y)
-    best: tuple[float, float] | None = None
-    best_len = float("inf")
-    for gx, gy in _standoff_candidates(fx, fy, from_x, from_y, standoff):
-        if not costmap.is_free_world(gx, gy):
-            continue
-        path = astar(costmap, start, (gx, gy))
-        if not path:
-            continue
-        plen = sum(math.hypot(path[k + 1][0] - path[k][0], path[k + 1][1] - path[k][1])
-                   for k in range(len(path) - 1))
-        if plen < best_len or (plen == best_len and (best is None or (gx, gy) < best)):
-            best_len = plen
-            best = (gx, gy)
-    return best
+        if plen < best_any_len or (plen == best_any_len and (best_any is None or (gx, gy) < best_any)):
+            best_any_len = plen
+            best_any = (gx, gy)
+        if clear_shot(costmap, gx, gy, fx, fy):
+            if plen < best_clear_len or (plen == best_clear_len and (best_clear is None or (gx, gy) < best_clear)):
+                best_clear_len = plen
+                best_clear = (gx, gy)
+    return best_clear if best_clear is not None else best_any
 
 
 def _snap_to_free(costmap: Costmap, wx: float, wy: float,
@@ -348,6 +341,28 @@ def line_of_sight(costmap: Costmap, x0: float, y0: float, x1: float, y1: float) 
     cells = _bresenham_cells(i0, j0, i1, j1)
     for i, j in cells:
         if not costmap.in_bounds(i, j) or not costmap.is_free(i, j):
+            return False
+    return True
+
+
+def clear_shot(costmap: Costmap, sx: float, sy: float, fx: float, fy: float,
+               margin: float = 0.10) -> bool:
+    """True if the straight spray line from ``(sx, sy)`` to the fire ``(fx, fy)``
+    crosses no wall -- i.e. the robot would not be spraying *through* an obstacle.
+
+    Only walls block the jet: they are the tall obstacles. Debris and gentle
+    terrain are low, so the ballistic arc clears them. Tested against the raw
+    (un-inflated) footprints expanded by a thin ``margin`` so the jet keeps a
+    small gap from wall corners."""
+    walls = costmap.walls
+    if not walls:
+        return True
+    dist = math.hypot(fx - sx, fy - sy)
+    n = max(2, int(dist / (costmap.res * 0.5)))
+    for k in range(n + 1):
+        t = k / n
+        px, py = sx + (fx - sx) * t, sy + (fy - sy) * t
+        if point_in_any_wall(px, py, walls, margin):
             return False
     return True
 
@@ -496,8 +511,29 @@ class WaypointFollower:
         return False
 
 
-FACE_TOL = 0.12
-FACE_HOLD_TICKS = 3
+FACE_TOL = 0.05
+FACE_HOLD_TICKS = 4
+
+
+def jet_aim_yaw(x: float, y: float, fire_xy: tuple[float, float],
+                iters: int = 6) -> float:
+    """Body yaw that lands the *water jet* on the fire from ``(x, y)``.
+
+    The muzzle sits ~0.1 m left of the pelvis and the stream arcs, so simply
+    pointing the body at the fire centre leaves the jet a fixed offset off to
+    the side. We Newton-iterate the yaw to drive the jet's lateral landing
+    error to zero -- this is what makes the robot actually hit while standing
+    still (no orbiting needed in calm air)."""
+    from .spray_rl.kinematics import aim_point
+    fx, fy = fire_xy
+    yaw = math.atan2(fy - y, fx - x)
+    rng = math.hypot(fx - x, fy - y) + 1e-6
+    for _ in range(iters):
+        land, _ = aim_point(x, y, yaw, fire_xy)
+        ex, ey = float(land[0]) - fx, float(land[1]) - fy
+        lateral = -math.sin(yaw) * ex + math.cos(yaw) * ey
+        yaw -= lateral / rng
+    return yaw
 
 
 class ApproachController:
@@ -525,9 +561,8 @@ class ApproachController:
     def _heading_err_to_fire(self) -> float:
         state = self.sim.get_state()
         x, y = float(state["pos"][0]), float(state["pos"][1])
-        fx, fy = self.fire_xy
         yaw = quat_yaw(state["quat"])
-        heading_target = math.atan2(fy - y, fx - x)
+        heading_target = jet_aim_yaw(x, y, self.fire_xy)
         return math.atan2(math.sin(heading_target - yaw),
                             math.cos(heading_target - yaw))
 

@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Ember Console</title>
+<style>
+:root{
+  --bg:#0d0e10; --panel:#151619; --panel2:#1a1c20; --line:#26282d; --line2:#33363c;
+  --text:#ededee; --muted:#9a9ea5; --faint:#6a6e76;
+  --accent:#3b82f6; --ok:#3fb950; --warn:#d29922; --bad:#f0564a; --fire:#e0703a;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+  font-size:13px;line-height:1.45;overflow:hidden}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line2);border-radius:5px}
+::-webkit-scrollbar-track{background:transparent}
+
+button{font-family:inherit;color:var(--text);cursor:pointer;border:1px solid var(--line2);
+  background:var(--panel);border-radius:6px;padding:7px 10px;font-size:12px;font-weight:500;
+  transition:background .1s,border-color .1s,color .1s}
+button:hover{background:var(--panel2);border-color:var(--faint)}
+button:active{background:#202329}
+button:disabled{opacity:.4;cursor:default}
+button.on{background:rgba(59,130,246,.15);border-color:var(--accent);color:#cfe0ff}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:#4f8df8}
+button.danger:hover{border-color:var(--bad);color:#ffb4ae;background:var(--panel2)}
+input,select{font-family:inherit;color:var(--text);background:var(--panel);
+  border:1px solid var(--line2);border-radius:6px;padding:7px 9px;font-size:12px;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+input::placeholder{color:var(--faint)}
+
+.shell{display:grid;grid-template-rows:48px 1fr;height:100vh}
+.topbar{display:flex;align-items:center;gap:16px;padding:0 14px;
+  background:var(--panel);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:14px;letter-spacing:.01em}
+.brand .mark{width:9px;height:9px;border-radius:2px;background:var(--fire)}
+.brand small{color:var(--faint);font-weight:400;font-size:12px}
+.topspacer{flex:1}
+.scenebox{display:flex;align-items:center;gap:7px}
+.scenebox label{font-size:11px;color:var(--muted)}
+.status-cluster{display:flex;align-items:center;gap:8px}
+.chip{display:flex;align-items:center;gap:6px;padding:5px 9px;border:1px solid var(--line);
+  border-radius:6px;background:var(--bg);font-family:var(--mono);font-size:11px;color:var(--muted)}
+.chip b{color:var(--text);font-weight:500}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.dot.off{background:var(--bad)}
+
+.main{display:grid;grid-template-columns:1fr 360px;min-height:0;overflow:hidden}
+.stage{position:relative;min-height:0;background:#000;overflow:hidden;
+  display:flex;align-items:center;justify-content:center}
+#streamImg{max-width:100%;max-height:100%;display:block}
+
+.overlay{position:absolute;z-index:3}
+.ov-tl{top:12px;left:12px}
+.ov-tr{top:12px;right:12px}
+.ov-bl{bottom:12px;left:12px;display:flex;gap:6px;flex-wrap:wrap;max-width:62%}
+.ov-br{bottom:12px;right:12px}
+.panelbox{background:rgba(21,22,25,.9);border:1px solid var(--line2);border-radius:6px}
+.scenetag{padding:6px 10px}
+.scenetag .k{font-size:10px;color:var(--faint)}
+.scenetag .v{font-family:var(--mono);font-size:13px;color:var(--text)}
+.pill{display:flex;align-items:center;gap:6px;padding:5px 9px;border-radius:5px;
+  border:1px solid var(--line2);background:rgba(21,22,25,.9);
+  font-family:var(--mono);font-size:11px;color:var(--muted)}
+.pill .led{width:6px;height:6px;border-radius:50%;background:var(--faint)}
+.pill.good{color:#bfeacb}.pill.good .led{background:var(--ok)}
+.pill.warn{color:#ecd5a3}.pill.warn .led{background:var(--warn)}
+.pill.bad{color:#f2c2bd}.pill.bad .led{background:var(--bad)}
+.windcard{padding:9px;display:flex;flex-direction:column;align-items:center;gap:4px;width:104px}
+.windcard .k{font-size:10px;color:var(--faint);letter-spacing:.04em}
+.windcard .v{font-family:var(--mono);font-size:11px;color:var(--text)}
+#windCanvas{display:block}
+.pip{width:260px;overflow:hidden;border-radius:6px}
+.pip .pip-h{display:flex;align-items:center;gap:6px;padding:4px 8px;font-size:10px;
+  color:var(--muted);border-bottom:1px solid var(--line2);background:rgba(21,22,25,.95)}
+.pip img{display:block;width:100%}
+#pip{display:none}
+
+.side{background:var(--bg);border-left:1px solid var(--line);min-height:0;overflow-y:auto;
+  padding:12px;display:flex;flex-direction:column;gap:12px;overscroll-behavior:contain}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card-h{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;
+  border-bottom:1px solid var(--line)}
+.card-h .t{font-size:12px;color:var(--text);font-weight:600}
+.card-h .x{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.card-b{padding:12px}
+
+.gauge-top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px}
+.gauge-top .lab{font-size:11px;color:var(--muted)}
+.gauge-top .num{font-family:var(--mono);font-size:15px;font-weight:600}
+.gauge{height:6px;border-radius:3px;background:#23262b;overflow:hidden}
+.gauge-fill{height:100%;width:100%;background:var(--fire);transition:width .3s linear}
+
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:1px;margin-top:12px;
+  background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.tile{background:var(--panel);padding:9px 11px}
+.tile .k{font-size:10px;color:var(--faint)}
+.tile .v{font-family:var(--mono);font-size:13px;color:var(--text);margin-top:2px}
+.tile .v small{color:var(--muted)}
+
+#navCanvas{display:block;width:100%;height:auto;border-radius:6px;border:1px solid var(--line);background:#0a0b0d}
+.legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:9px;font-size:11px;color:var(--muted)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.stepper{display:flex;gap:6px;margin:11px 0}
+.step{flex:1;text-align:center;font-size:10px;color:var(--faint);padding:5px 2px;
+  border:1px solid var(--line2);border-radius:5px;background:var(--bg)}
+.step.active{color:#fff;background:var(--accent);border-color:var(--accent)}
+.step.done{color:#cfe0ff;border-color:var(--accent)}
+.row{display:flex;gap:8px}
+.row>*{flex:1}
+
+.cmdline{display:flex;gap:8px}
+.cmdline input{flex:1}
+.tasklist{margin-top:11px;display:flex;flex-direction:column;gap:5px}
+.task{display:flex;align-items:center;gap:9px;padding:7px 10px;border:1px solid var(--line);
+  border-radius:6px;background:var(--bg);font-size:12px}
+.task .ix{width:17px;height:17px;border-radius:50%;border:1px solid var(--line2);
+  display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--muted);flex:0 0 auto}
+.task.active{border-color:var(--accent)}
+.task.active .ix{background:var(--accent);color:#fff;border-color:var(--accent)}
+.task.done{opacity:.55}.task.done .ix{background:var(--ok);color:#06210f;border-color:var(--ok)}
+.task .ty{font-family:var(--mono);font-size:11px}
+.task .tg{color:var(--muted);font-family:var(--mono);font-size:11px}
+.msg{margin-top:9px;font-size:11.5px;color:var(--muted);font-family:var(--mono);min-height:14px}
+.empty{color:var(--faint);font-size:11px}
+
+.dpad{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,38px);
+  gap:6px;max-width:182px;margin:0 auto}
+.dpad button{padding:0;font-size:14px;display:flex;align-items:center;justify-content:center}
+.dpad button:empty{visibility:hidden;pointer-events:none}
+.dpad .stop{color:var(--bad);font-size:10px}
+.seg{display:flex;border:1px solid var(--line2);border-radius:6px;overflow:hidden}
+.seg button{flex:1;border:0;border-radius:0;background:var(--panel)}
+.seg button+button{border-left:1px solid var(--line2)}
+.seg button.on{background:rgba(59,130,246,.15);color:#cfe0ff}
+.ctl-label{font-size:11px;color:var(--muted);margin:13px 0 7px}
+.keys{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px;font-size:11px;color:var(--faint)}
+kbd{font-family:var(--mono);font-size:10px;background:var(--panel2);border:1px solid var(--line2);
+  border-radius:4px;padding:2px 5px;color:var(--muted)}
+
+@media (max-height:900px){.card-b{padding:10px}.side{gap:10px;padding:10px}}
+@media (max-width:1180px){
+  body{overflow:auto}
+  .shell{height:auto;min-height:100vh;grid-template-rows:48px auto}
+  .main{grid-template-columns:1fr;overflow:visible}
+  .stage{height:58vh;min-height:320px}
+  .side{overflow:visible;min-height:auto;border-left:0;border-top:1px solid var(--line)}
+}
+@media (max-width:560px){.brand small{display:none}#robotChip{display:none}.ov-bl{max-width:90%}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand"><span class="mark"></span>Ember <small>Console</small></div>
+    <div class="topspacer"></div>
+    <div class="scenebox"><label>Scene</label><select id="sceneSel"></select></div>
+    <div class="status-cluster">
+      <div class="chip"><span id="linkDot" class="dot"></span><span id="linkTxt">Live</span></div>
+      <div class="chip">sim&nbsp;<b id="simClock">0.0s</b></div>
+      <div class="chip" id="robotChip">state&nbsp;<b id="robotState">--</b></div>
+    </div>
+  </header>
+
+  <div class="main">
+    <section class="stage">
+      <img id="streamImg" src="/stream"/>
+      <div class="overlay ov-tl">
+        <div class="panelbox scenetag"><span class="k">scene</span> <span class="v" id="sceneName">--</span></div>
+      </div>
+      <div class="overlay ov-tr">
+        <div class="panelbox windcard">
+          <div class="k">wind</div>
+          <canvas id="windCanvas" width="84" height="84"></canvas>
+          <div class="v" id="windVal">off</div>
+        </div>
+      </div>
+      <div class="overlay ov-bl">
+        <div class="pill" id="sprayPill"><span class="led"></span><span>spray off</span></div>
+        <div class="pill" id="hitPill"><span class="led"></span><span>--</span></div>
+        <div class="pill" id="approachPill"><span class="led"></span><span>manual</span></div>
+      </div>
+      <div class="overlay ov-br">
+        <div class="panelbox pip" id="pip">
+          <div class="pip-h"><span class="dot"></span>robot cam</div>
+          <img id="pipImg" src="/camera"/>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="card">
+        <div class="card-h"><span class="t">Telemetry</span><span class="x" id="targetTag">fire --</span></div>
+        <div class="card-b">
+          <div class="gauge-top"><span class="lab">Fire integrity</span><span class="num" id="firePct">100%</span></div>
+          <div class="gauge"><div class="gauge-fill" id="fireFill"></div></div>
+          <div class="tiles">
+            <div class="tile"><div class="k">Position</div><div class="v" id="posVal">0.00, 0.00</div></div>
+            <div class="tile"><div class="k">Speed</div><div class="v" id="spdVal">0.00 <small>m/s</small></div></div>
+            <div class="tile"><div class="k">Command</div><div class="v" id="cmdVal">0, 0, 0</div></div>
+            <div class="tile"><div class="k">Heading</div><div class="v" id="hdgVal">0&deg;</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><span class="t">Navigation</span><span class="x">A* costmap</span></div>
+        <div class="card-b">
+          <canvas id="navCanvas" width="336" height="232"></canvas>
+          <div class="legend">
+            <span><i style="background:#3b82f6"></i>robot</span>
+            <span><i style="background:#f0564a"></i>fire</span>
+            <span><i style="background:#e0a13a"></i>target</span>
+            <span><i style="background:#5a87c7"></i>home</span>
+            <span><i style="background:#3a3f47"></i>obstacle</span>
+          </div>
+          <div class="stepper" id="stepper">
+            <div class="step" data-p="navigate">Navigate</div>
+            <div class="step" data-p="face">Face</div>
+            <div class="step" data-p="ready">Ready</div>
+          </div>
+          <div class="row">
+            <button id="approachBtn" class="primary">Approach fire</button>
+            <button id="resetBtn" class="danger">Reset</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><span class="t">Mission</span><span class="x" id="missionTag">idle</span></div>
+        <div class="card-b">
+          <div class="cmdline">
+            <input id="missionIn" placeholder="extinguish all fires"/>
+            <button id="missionBtn" class="primary">Run</button>
+            <button id="missionStopBtn" class="danger">Stop</button>
+          </div>
+          <div class="tasklist" id="taskList"><div class="empty">No active mission.</div></div>
+          <div class="msg" id="missionMsg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><span class="t">Manual control</span><span class="x">teleop</span></div>
+        <div class="card-b">
+          <div class="dpad">
+            <button data-vy="0.3">&#8598;</button>
+            <button data-vx="0.8">&#9650;</button>
+            <button data-vy="-0.3">&#8599;</button>
+            <button data-yaw="0.6">&#8634;</button>
+            <button class="stop" id="stopBtn">STOP</button>
+            <button data-yaw="-0.6">&#8635;</button>
+            <button></button>
+            <button data-vx="-0.4">&#9660;</button>
+            <button></button>
+          </div>
+          <div class="ctl-label">Arm pose</div>
+          <div class="seg" id="armSeg">
+            <button data-pose="carry">Carry</button>
+            <button data-pose="aim">Aim</button>
+            <button data-pose="down">Down</button>
+          </div>
+          <div class="ctl-label">Systems</div>
+          <div class="row">
+            <button id="sprayBtn">Spray</button>
+            <button id="headingBtn">Auto-steer</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button id="windBtn">Gusty wind</button>
+            <button id="reigniteBtn" class="danger">Reignite</button>
+          </div>
+          <div class="keys">
+            <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive
+            <kbd>Q</kbd><kbd>E</kbd> strafe <kbd>Space</kbd> stop <kbd>F</kbd> spray
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let vx=0,vy=0,yaw=0,sceneBusy=false,navOcc=null,navMeta=null,navHit=null;
+let hh=false,windOn=false,curYaw=0;
+
+function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json())
+  .then(d=>{$('cmdVal').textContent=d.cmd.map(x=>x.toFixed(2)).join(', ');}).catch(()=>{});}
+function setApproach(on){fetch('/approach?on='+(on?1:0)).then(r=>r.json())
+  .then(d=>{$('approachBtn').disabled=!!d.approach;}).catch(()=>{});}
+function resetPose(){fetch('/reset').then(()=>setApproach(false)).catch(()=>{});}
+function phaseLabel(p){return p==='navigate'?'navigating':p==='face'?'aligning':
+  p==='ready'?'in position':(p||'');}
+
+function drawNav(d){
+  if(!d)return;
+  const c=$('navCanvas'),ctx=c.getContext('2d'),w=c.width,h=c.height;
+  const ox=d.origin[0],oy=d.origin[1],res=d.res,nx=d.shape[0],ny=d.shape[1];
+  const meta=ox+'|'+oy+'|'+res+'|'+nx+'|'+ny;
+  if(navMeta!==meta){navMeta=meta;navOcc=d.occupied;}
+  ctx.fillStyle='#0a0b0d';ctx.fillRect(0,0,w,h);
+  const sc=Math.min(w/(nx*res),h/(ny*res));
+  const padX=(w-nx*res*sc)/2,padY=(h-ny*res*sc)/2;
+  const toX=x=>padX+(x-ox)*sc, toY=y=>padY+(ny*res-(y-oy))*sc;
+  navHit={ox,oy,res,ny,sc,padX,padY,fires:d.fires};
+  ctx.strokeStyle='rgba(40,42,48,.55)';ctx.lineWidth=1;
+  for(let gx=Math.ceil(ox);gx<ox+nx*res;gx++){ctx.beginPath();ctx.moveTo(toX(gx),padY);ctx.lineTo(toX(gx),h-padY);ctx.stroke();}
+  for(let gy=Math.ceil(oy);gy<oy+ny*res;gy++){ctx.beginPath();ctx.moveTo(padX,toY(gy));ctx.lineTo(w-padX,toY(gy));ctx.stroke();}
+  if(navOcc){ctx.fillStyle='#3a3f47';
+    for(let j=0;j<ny;j++)for(let i=0;i<nx;i++)if(navOcc[j*nx+i])
+      ctx.fillRect(toX(ox+i*res),toY(oy+(j+1)*res),res*sc+.5,res*sc+.5);}
+  if(d.home){ctx.fillStyle='#5a87c7';ctx.beginPath();ctx.arc(toX(d.home[0]),toY(d.home[1]),3.5,0,6.283);ctx.fill();}
+  if(d.path&&d.path.length>1){
+    ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();
+    ctx.moveTo(toX(d.path[0][0]),toY(d.path[0][1]));
+    for(let k=1;k<d.path.length;k++)ctx.lineTo(toX(d.path[k][0]),toY(d.path[k][1]));
+    ctx.stroke();
+    const gl=d.path[d.path.length-1],gx=toX(gl[0]),gy=toY(gl[1]);
+    ctx.strokeStyle='#3b82f6';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(gx,gy,6,0,6.283);ctx.stroke();
+    const tf=d.fires[d.targeted_fire];
+    if(tf&&tf.health>0){ctx.setLineDash([4,3]);ctx.strokeStyle='rgba(224,161,58,.6)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(gx,gy);ctx.lineTo(toX(tf.pos[0]),toY(tf.pos[1]));ctx.stroke();ctx.setLineDash([]);}}
+  d.fires.forEach((f,i)=>{
+    const fx=toX(f.pos[0]),fy=toY(f.pos[1]);
+    if(f.health<=0){ctx.fillStyle='#3a3f47';ctx.beginPath();ctx.arc(fx,fy,3.5,0,6.283);ctx.fill();return;}
+    const tg=i===d.targeted_fire;ctx.fillStyle=tg?'#e0a13a':'#f0564a';
+    ctx.beginPath();ctx.arc(fx,fy,tg?5:4,0,6.283);ctx.fill();
+    if(tg){ctx.strokeStyle='rgba(224,161,58,.5)';ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(fx,fy,9,0,6.283);ctx.stroke();}});
+  const rp=d.robot.pos;curYaw=d.robot.yaw;
+  let rx=toX(rp[0]),ry=toY(rp[1]);
+  const oob=(rx<3||rx>w-3||ry<3||ry>h-3);
+  rx=Math.max(7,Math.min(w-7,rx));ry=Math.max(7,Math.min(h-7,ry));
+  ctx.save();ctx.translate(rx,ry);ctx.rotate(-curYaw);
+  ctx.fillStyle=oob?'#f0564a':'#3b82f6';
+  ctx.beginPath();ctx.moveTo(9,0);ctx.lineTo(-5,5);ctx.lineTo(-2,0);ctx.lineTo(-5,-5);ctx.closePath();ctx.fill();
+  ctx.restore();
+  $('approachBtn').disabled=!!d.approach;
+  setStepper(d.phase);
+}
+function setStepper(p){
+  const order=['navigate','face','ready'],idx=order.indexOf(p);
+  document.querySelectorAll('#stepper .step').forEach(el=>{
+    const i=order.indexOf(el.dataset.p);
+    el.className='step'+(i===idx?' active':(idx>=0&&i<idx?' done':''));});
+}
+$('navCanvas').addEventListener('click',e=>{
+  if(!navHit)return;const c=$('navCanvas'),r=c.getBoundingClientRect();
+  const mx=(e.clientX-r.left)*(c.width/r.width),my=(e.clientY-r.top)*(c.height/r.height);
+  const {ox,oy,res,ny,sc,padX,padY,fires}=navHit;
+  const toX=x=>padX+(x-ox)*sc, toY=y=>padY+(ny*res-(y-oy))*sc;
+  let best=-1,bd=1e9;
+  fires.forEach((f,i)=>{if(f.health<=0)return;const d=Math.hypot(mx-toX(f.pos[0]),my-toY(f.pos[1]));
+    if(d<12&&d<bd){bd=d;best=i;}});
+  if(best>=0)fetch('/target?idx='+best).catch(()=>{});});
+
+function drawWind(wx,wy,enabled){
+  const c=$('windCanvas'),ctx=c.getContext('2d'),s=c.width,cx=s/2,cy=s/2,R=s/2-5;
+  ctx.clearRect(0,0,s,s);
+  ctx.strokeStyle='rgba(106,110,118,.5)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.arc(cx,cy,R,0,6.283);ctx.stroke();
+  ctx.strokeStyle='rgba(59,130,246,.35)';ctx.lineWidth=1.5;ctx.beginPath();
+  ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.cos(-curYaw)*R*.6,cy+Math.sin(-curYaw)*R*.6);ctx.stroke();
+  const mag=Math.hypot(wx,wy);
+  if(!enabled||mag<1e-3){ctx.fillStyle='#6a6e76';ctx.font='10px ui-monospace';
+    ctx.textAlign='center';ctx.fillText('calm',cx,cy+3);return;}
+  const len=Math.min(1,mag/8)*R*.8,ang=Math.atan2(-wy,wx);
+  const ex=cx+Math.cos(ang)*len,ey=cy+Math.sin(ang)*len;
+  ctx.strokeStyle='#3b82f6';ctx.fillStyle='#3b82f6';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(cx-Math.cos(ang)*len*.3,cy-Math.sin(ang)*len*.3);ctx.lineTo(ex,ey);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(ex,ey);
+  ctx.lineTo(ex-Math.cos(ang-.4)*6,ey-Math.sin(ang-.4)*6);
+  ctx.lineTo(ex-Math.cos(ang+.4)*6,ey-Math.sin(ang+.4)*6);ctx.closePath();ctx.fill();
+}
+
+function setPill(id,cls,txt){const el=$(id);el.className='pill '+cls;
+  el.querySelector('span:last-child').textContent=txt;}
+
+function setPip(on){$('pip').style.display=on?'block':'none';}
+function loadScenes(){fetch('/scenes').then(r=>r.json()).then(d=>{
+  const sel=$('sceneSel');sel.innerHTML='';
+  d.scenes.forEach(s=>{const o=document.createElement('option');
+    o.value=s.key;o.textContent=s.label;if(s.key===d.current)o.selected=true;sel.appendChild(o);});
+  $('sceneName').textContent=(d.scenes.find(s=>s.key===d.current)||{}).label||d.current;
+  setPip(!!d.has_camera);}).catch(()=>{});}
+function switchScene(key){
+  if(sceneBusy)return;sceneBusy=true;
+  fetch('/scene?key='+encodeURIComponent(key)).then(r=>{if(!r.ok)throw 0;return r.json();})
+   .then(d=>{setPip(!!d.has_camera);vx=vy=yaw=0;send();navOcc=null;navMeta=null;setApproach(false);
+     const o=$('sceneSel').selectedOptions[0];$('sceneName').textContent=o?o.textContent:key;})
+   .catch(loadScenes).finally(()=>{sceneBusy=false;});}
+$('sceneSel').addEventListener('change',e=>switchScene(e.target.value));
+
+function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
+  document.querySelectorAll('#armSeg button').forEach(b=>b.classList.toggle('on',b.dataset.pose===d.arm_pose));}).catch(()=>{});}
+function toggleSpray(){fetch('/spray').then(r=>r.json()).catch(()=>{});}
+function toggleHeading(){hh=!hh;fetch('/heading?on='+(hh?1:0)).then(r=>r.json())
+  .then(d=>{hh=!!d.heading_hold;$('headingBtn').classList.toggle('on',hh);}).catch(()=>{});}
+function toggleWind(){fetch('/wind').then(r=>r.json())
+  .then(d=>{windOn=!!d.wind_enabled;$('windBtn').classList.toggle('on',windOn);}).catch(()=>{});}
+
+function runMission(){const v=$('missionIn').value.trim();if(!v)return;
+  fetch('/mission?prompt='+encodeURIComponent(v)).then(r=>r.json())
+   .then(d=>{if(d.error)$('missionMsg').textContent='error: '+d.error;}).catch(()=>{});}
+function stopMission(){fetch('/mission_stop').catch(()=>{});}
+function renderMission(d){
+  const tag=$('missionTag'),list=$('taskList'),msg=$('missionMsg');
+  if(!d||(!d.running&&!d.done&&!d.tasks)){tag.textContent='idle';
+    list.innerHTML='<div class="empty">No active mission.</div>';msg.textContent='';return;}
+  tag.textContent=d.done?'complete':(d.state||'running');
+  const tasks=d.tasks||[];
+  if(tasks.length){const cur=d.task_index!=null?d.task_index:-1;
+    list.innerHTML=tasks.map((t,i)=>{
+      const st=d.done||i<cur?'done':(i===cur?'active':'');
+      const tgt=t.target!=null?('#'+t.target):'';
+      return `<div class="task ${st}"><span class="ix">${i+1}</span><span class="ty">${t.type}</span><span class="tg">${tgt}</span></div>`;}).join('');}
+  msg.textContent=d.message?('› '+d.message):'';
+}
+
+function applyHold(b,active){
+  if('vx'in b.dataset)vx=active?+b.dataset.vx:0;
+  if('vy'in b.dataset)vy=active?+b.dataset.vy:0;
+  if('yaw'in b.dataset)yaw=active?+b.dataset.yaw:0;send();}
+document.querySelectorAll('.dpad button[data-vx],.dpad button[data-vy],.dpad button[data-yaw]').forEach(b=>{
+  b.addEventListener('pointerdown',e=>{e.preventDefault();applyHold(b,true);});
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,()=>applyHold(b,false)));});
+$('stopBtn').addEventListener('click',()=>{vx=vy=yaw=0;send();setApproach(false);});
+
+$('approachBtn').addEventListener('click',()=>setApproach(true));
+$('resetBtn').addEventListener('click',resetPose);
+$('missionBtn').addEventListener('click',runMission);
+$('missionStopBtn').addEventListener('click',stopMission);
+$('missionIn').addEventListener('keydown',e=>{if(e.key==='Enter')runMission();});
+$('sprayBtn').addEventListener('click',toggleSpray);
+$('headingBtn').addEventListener('click',toggleHeading);
+$('windBtn').addEventListener('click',toggleWind);
+$('reigniteBtn').addEventListener('click',()=>fetch('/reignite').catch(()=>{}));
+document.querySelectorAll('#armSeg button').forEach(b=>b.addEventListener('click',()=>setArm(b.dataset.pose)));
+
+document.addEventListener('keydown',e=>{
+  if(e.repeat||(e.target&&e.target.tagName==='INPUT'))return;
+  switch(e.key.toLowerCase()){
+    case'w':vx=0.8;break;case's':vx=-0.4;break;case'a':yaw=0.6;break;case'd':yaw=-0.6;break;
+    case'q':vy=0.3;break;case'e':vy=-0.3;break;
+    case' ':vx=vy=yaw=0;setApproach(false);break;
+    case'h':toggleHeading();return;
+    case'1':setArm('carry');return;case'2':setArm('aim');return;case'3':setArm('down');return;
+    case'f':toggleSpray();return;case'g':fetch('/reignite').catch(()=>{});return;
+    default:return;}
+  send();});
+document.addEventListener('keyup',e=>{
+  if(e.target&&e.target.tagName==='INPUT')return;
+  switch(e.key.toLowerCase()){case'w':case's':vx=0;break;case'a':case'd':yaw=0;break;
+    case'q':case'e':vy=0;break;default:return;}send();});
+
+function setLink(ok){$('linkDot').className='dot '+(ok?'':'off');$('linkTxt').textContent=ok?'Live':'Offline';}
+setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
+  setLink(true);
+  $('simClock').textContent=(d.sim_time||0).toFixed(1)+'s';
+  const fell=d.fell,blk=d.blocked;
+  const rs=$('robotState');rs.textContent=fell?'fallen':(blk?'blocked':'nominal');
+  rs.style.color=fell?'var(--bad)':(blk?'var(--warn)':'var(--ok)');
+  const pct=Math.max(0,Math.round(d.fire_health*100));
+  $('firePct').textContent=d.fire_health<=0?'out':pct+'%';
+  $('fireFill').style.width=Math.max(0,d.fire_health*100)+'%';
+  $('fireFill').style.background=d.fire_health<=0?'var(--ok)':'var(--fire)';
+  $('firePct').style.color=d.fire_health<=0?'var(--ok)':'';
+  $('posVal').textContent=d.pos[0].toFixed(2)+', '+d.pos[1].toFixed(2);
+  $('spdVal').innerHTML=Math.hypot(d.lin_vel[0],d.lin_vel[1]).toFixed(2)+' <small>m/s</small>';
+  $('cmdVal').textContent=d.cmd.map(x=>x.toFixed(1)).join(', ');
+  $('hdgVal').innerHTML=Math.round(curYaw*180/Math.PI)+'&deg;';
+  $('targetTag').textContent='fire '+d.targeted_fire;
+  d.spraying?setPill('sprayPill','good','spray on'):setPill('sprayPill','','spray off');
+  if(d.fire_health<=0)setPill('hitPill','good','extinguished');
+  else if(d.spraying)d.hitting?setPill('hitPill','good','on target'):setPill('hitPill','bad','off target');
+  else setPill('hitPill','','--');
+  const ph=d.approach_phase;
+  if(ph==='ready')setPill('approachPill','good','in position');
+  else if(ph)setPill('approachPill','warn',phaseLabel(ph));
+  else setPill('approachPill','','manual');
+  document.querySelectorAll('#armSeg button').forEach(b=>b.classList.toggle('on',b.dataset.pose===d.arm_pose));
+  $('sprayBtn').classList.toggle('on',!!d.spraying);
+  windOn=!!d.wind_enabled;$('windBtn').classList.toggle('on',windOn);
+  const wx=(d.wind&&d.wind[0])||0,wy=(d.wind&&d.wind[1])||0;
+  drawWind(wx,wy,windOn);
+  $('windVal').textContent=windOn?(Math.hypot(wx,wy).toFixed(1)+' m/s\u00B2'):'off';
+}).catch(()=>setLink(false));},250);
+setInterval(()=>fetch('/nav').then(r=>r.json()).then(d=>{if(d&&!d.error)drawNav(d);}).catch(()=>{}),350);
+setInterval(()=>fetch('/mission_status').then(r=>r.json()).then(renderMission).catch(()=>{}),600);
+loadScenes();
+</script>
+</body>
+</html>

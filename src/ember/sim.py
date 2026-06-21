@@ -65,11 +65,17 @@ NOZZLE_REST_PITCH = -0.08  # fixed ~level elevation (no auto-aim)
 # the fire goes out only after EXTINGUISH_TIME of cumulative on-target hits.
 FIRE_AIM_HEIGHT = 0.45
 HIT_RADIUS = 0.25
+SPRAY_LANDING_NOISE_RADIUS = 0.25
 EXTINGUISH_TIME = 10.0
 
 BLOCKED_WINDOW = 2.0
 BLOCKED_DISP_THRESH = 0.05
 BLOCKED_CMD_THRESH = 0.05
+
+# Once the robot is in position (ApproachController -> "ready"), hold for this
+# long then auto-start the spray. This is the hand-off point where the RL
+# spray-aim correction policy takes over (Phase 6).
+READY_SPRAY_DELAY = 1.0
 
 
 def _y_quat(phi: float) -> list[float]:
@@ -245,12 +251,9 @@ class G1Sim:
         self.cam.elevation = -15.0
         self.cam.azimuth = 135.0
 
-        # Robot-mounted ego camera (overlay only): separate renderer + frame
-        # buffer + cached world pose (for later ground-plane projection).
+        # Robot-mounted ego camera (overlay only): drives the live POV stream.
         self.cam_renderer = None
         self.ego_cam_id = -1
-        self._last_cam_rgb = None
-        self._ego_pose = None  # (pos[3], rot[3x3] world<-cam) or None
 
         self.frames = FrameBuffer()
         self.cam_frames = FrameBuffer()
@@ -259,6 +262,19 @@ class G1Sim:
         self.navigator = None
         self._approach_enabled = False
         self._approach_ready = False
+        self._ready_time: float | None = None  # sim time READY was reached
+        self.auto_spray = True   # default: auto-spray after holding READY 1 s
+        # When a MissionExecutor is driving, it owns targeting/approach/spray;
+        # the sim must not also auto-advance targets or auto-spray (the two
+        # controllers fight -- e.g. the sim drags the robot to the next fire
+        # mid-RETURN). Manual "Approach fire" use leaves this False.
+        self.external_control = False
+        self._spray_controller = None
+        self._spray_noise_radius = SPRAY_LANDING_NOISE_RADIUS
+        self._spray_rng = np.random.default_rng()
+        self.wind_enabled = False         # gusty crosswind on the jet (off by default)
+        self._wind = None                 # lazy spray_rl.kinematics.GustyWind
+        self._aim_hist = None             # flight-lag buffer of noisy landings
         self._nav_costmap = None
         self._nav_path: list[tuple[float, float]] = []
         self._blocked = False
@@ -271,6 +287,7 @@ class G1Sim:
             if not _nav:
                 self.navigator = None
                 self._approach_ready = False
+                self._ready_time = None
             if vx is not None:
                 self.cmd[0] = clamp(vx, *VX_RANGE)
             if vy is not None:
@@ -306,9 +323,62 @@ class G1Sim:
         return self.overlay_arm_pose
 
     def set_spray(self, on=None):
-        """Toggle (or set) the water jet (fire scene only). Returns the state."""
+        """Toggle (or set) the water jet (fire scene only). Returns the state.
+
+        The nozzle stays at its fixed rest pitch; spray-aim is corrected purely
+        by ego motion from the spray controller."""
+        was = self.spraying
         self.spraying = (not self.spraying) if on is None else bool(on)
+        self.aim_pitch = NOZZLE_REST_PITCH
+        if self.spraying and not was:
+            self._ensure_spray_controller()
         return self.spraying
+
+    def _ensure_spray_controller(self) -> None:
+        if self._spray_controller is None:
+            from .spray_rl.policy import load_spray_controller
+            self._spray_controller = load_spray_controller()
+
+    def enable_wind(self, on: bool = True, sigma: float | None = None) -> bool:
+        """Toggle a gusty crosswind that deflects the water jet. ``sigma`` is the
+        wind-acceleration std (m/s^2); defaults to the demo strength."""
+        from .spray_rl.kinematics import GustyWind, WIND_SIGMA_DEMO
+        self.wind_enabled = bool(on)
+        if self.wind_enabled:
+            if self._wind is None:
+                self._wind = GustyWind(sigma=sigma or WIND_SIGMA_DEMO, rng=self._spray_rng)
+            elif sigma is not None:
+                self._wind.sigma = sigma
+        return self.wind_enabled
+
+    def wind_value(self) -> np.ndarray:
+        """Current true wind acceleration (m/s^2), or zeros when disabled."""
+        if self.wind_enabled and self._wind is not None:
+            return self._wind.value
+        return np.zeros(2)
+
+    def wind_reading(self, rng=None) -> np.ndarray:
+        """Noisy wind reading for the policy (partial observability)."""
+        if self.wind_enabled and self._wind is not None:
+            return self._wind.observe()
+        return np.zeros(2)
+
+    def wind_reading_delayed(self, lag: int, rng=None) -> np.ndarray:
+        """Noisy wind reading from ``lag`` control steps ago (Smith-predictor input)."""
+        if self.wind_enabled and self._wind is not None:
+            return self._wind.observe_delayed(lag)
+        return np.zeros(2)
+
+    def push_aim(self, aim_now: np.ndarray) -> np.ndarray:
+        """Buffer the current noisy landing and return the one FLIGHT_LAG ago."""
+        from .spray_rl.kinematics import FLIGHT_LAG_STEPS
+        aim_now = np.asarray(aim_now, float)
+        if self._aim_hist is None or self._aim_hist.maxlen != FLIGHT_LAG_STEPS:
+            self._aim_hist = deque([aim_now.copy()] * FLIGHT_LAG_STEPS,
+                                   maxlen=FLIGHT_LAG_STEPS)
+        delayed = self._aim_hist[0].copy()
+        self._aim_hist.append(aim_now.copy())
+        return delayed
 
     def reignite(self):
         """Restore all fires to full health (for repeated demo runs)."""
@@ -339,6 +409,7 @@ class G1Sim:
             "targeted_fire": self.targeted_fire,
             "fire_health": self.fire_health[self.targeted_fire],
             "blocked": self._blocked,
+            "wind": self.wind_value().tolist(),
             "approach_phase": (self.navigator.phase
                                if self._is_approach_controller()
                                else ("ready" if self._approach_ready else None)),
@@ -355,7 +426,16 @@ class G1Sim:
         return isinstance(self.navigator, ApproachController)
 
     def _advance_targeted_fire(self) -> None:
+        # Under a MissionExecutor the executor owns target selection; auto-
+        # advancing here would yank the robot to the next fire mid-mission.
+        if self.external_control:
+            return
         from .nav import nearest_burning_fire
+        # The current target just went out: drop READY so the jet shuts off and
+        # the robot stops aiming at it. The next fire is reached with a fresh
+        # approach (navigate + face), not by spinning in place toward it.
+        self._approach_ready = False
+        self._ready_time = None
         x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
         nxt = nearest_burning_fire(self.fire_positions, self.fire_health, x, y)
         if nxt is None:
@@ -424,6 +504,7 @@ class G1Sim:
         """Autonomously approach targeted fire: navigate, face, ready."""
         self._approach_enabled = bool(on)
         self._approach_ready = False
+        self._ready_time = None
         if not self._approach_enabled:
             self.navigator = None
             return False
@@ -531,21 +612,6 @@ class G1Sim:
     @property
     def has_camera(self) -> bool:
         return bool(self.overlay_scene)
-
-    def get_camera_frame(self, encode: bool = False):
-        """Latest robot-POV frame. ``encode=False`` -> RGB ndarray (feed the
-        flame detector); ``encode=True`` -> JPEG bytes (for streaming). Returns
-        None until the first ego frame has rendered."""
-        return self.cam_frames.get() if encode else self._last_cam_rgb
-
-    def get_camera_pose(self):
-        """Ego camera world pose as ``(pos[3], rot[3x3])`` or None. ``rot``
-        columns are the camera axes in world (MuJoCo cam looks along -Z)."""
-        return self._ego_pose
-
-    def get_camera_intrinsics(self):
-        """(fovy_deg, width, height) of the ego camera."""
-        return (CAM_FOVY, CAM_W, CAM_H)
 
     # -- joint maps & policy ------------------------------------------------- #
     def _build_leg_maps(self):
@@ -671,13 +737,19 @@ class G1Sim:
         if mz is None:
             return
         muzzle, direction = mz
-        pts, landing = effects.trajectory(muzzle, direction, self.jet_speed)
+        pts, landing = effects.trajectory(muzzle, direction, self.jet_speed,
+                                          wind=tuple(self.wind_value()))
         tidx = self.targeted_fire
         if tidx >= len(self.fire_positions):
             tidx = 0
         pos = self.fire_positions[tidx]
         center = np.asarray(pos, float) + [0, 0, FIRE_AIM_HEIGHT]
-        idx, hit, _ = effects.hit_index(pts, center, HIT_RADIUS)
+        from .spray_rl.kinematics import sample_disc_offset
+        nx, ny = sample_disc_offset(self._spray_rng, self._spray_noise_radius)
+        aim_center = center.copy()
+        aim_center[0] += nx
+        aim_center[1] += ny
+        idx, hit, _ = effects.hit_index(pts, aim_center, HIT_RADIUS)
         self._water, self._water_landing, self._water_hit_idx = pts, landing, idx
         health = self.fire_health[tidx]
         self._hitting = hit = hit and health > 0.0
@@ -728,12 +800,7 @@ class G1Sim:
             return
         self.cam_renderer.update_scene(self.render_data, camera=self.ego_cam_id)
         self._decorate(self.cam_renderer.scene)
-        rgb = self.cam_renderer.render()
-        self._last_cam_rgb = rgb
-        self.cam_frames.set(encode_jpeg(rgb))
-        cid = self.ego_cam_id
-        self._ego_pose = (self.render_data.cam_xpos[cid].copy(),
-                          self.render_data.cam_xmat[cid].reshape(3, 3).copy())
+        self.cam_frames.set(encode_jpeg(self.cam_renderer.render()))
 
     def _render_loop(self):
         interval = 1.0 / RENDER_FPS
@@ -777,6 +844,7 @@ class G1Sim:
                         if (self._is_approach_controller()
                                 and self.navigator.phase == "ready"):
                             self._approach_ready = True
+                            self._ready_time = float(self.data.time)
                         self.navigator = None
                         self._approach_enabled = False
                 elif self.heading_hold and not self._manual_yaw:
@@ -800,6 +868,10 @@ class G1Sim:
                     self._blocked_replan_done = True
                 elif not self._blocked:
                     self._blocked_replan_done = False
+                if self.wind_enabled and self._wind is not None:
+                    self._wind.step()
+                self._maybe_auto_spray()
+                self._update_spray_policy()
                 self._compute_action()
                 self._fell = self.data.qpos[2] < 0.4
 
@@ -815,6 +887,63 @@ class G1Sim:
             if render_thread is not None:
                 render_thread.join(timeout=3.0)
             self._release_render()
+
+    def _update_spray_policy(self) -> None:
+        """Keep the jet on the fire while spraying, without orbiting it.
+
+        Calm air: the base stays planted (``vx = vy = 0``) and we apply only a
+        small yaw correction that re-aims the *jet* (not the body) at the fire.
+        Rotating in place can track the slow sway of the blind walker but
+        physically cannot translate into an orbit -- the circling came entirely
+        from the old policy commanding strafe/forward motion.
+
+        Wind on: hand off to the RL/PID spray controller, which is allowed to
+        translate to chase a gust-deflected stream (its Phase 6 job), and only
+        while the jet is off target."""
+        if not self.spraying:
+            return
+        tf = self.targeted_fire
+        if tf >= len(self.fire_health) or self.fire_health[tf] <= 0:
+            return
+        if self.wind_enabled and not self._hitting:
+            self._ensure_spray_controller()
+            from .spray_rl.kinematics import clamp_action, obs_from_sim
+            obs = obs_from_sim(self, rng=self._spray_rng)
+            vx, vy, yaw = clamp_action(self._spray_controller.act(obs))
+            self.set_command(vx, vy, yaw, _nav=True)
+            return
+        from .nav import jet_aim_yaw
+        x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
+        yaw = quat_yaw(self.data.qpos[3:7])
+        fx, fy = self.fire_positions[tf][0], self.fire_positions[tf][1]
+        err = jet_aim_yaw(x, y, (fx, fy)) - yaw
+        err = math.atan2(math.sin(err), math.cos(err))
+        # Only fine-track here: a large error means the wrong pose entirely (a
+        # fresh approach handles that). Spinning a planted walker fast tips it.
+        if abs(err) <= 0.02 or abs(err) > 0.35:
+            yaw_cmd = 0.0
+        else:
+            yaw_cmd = clamp(0.8 * err, -0.25, 0.25)
+        self.set_command(0.0, 0.0, yaw_cmd, _nav=True)
+
+    def _maybe_auto_spray(self) -> None:
+        """Keep the water jet matched to the robot's readiness on procedural
+        scenes: turn it ON once it has held READY at a live target for
+        ``READY_SPRAY_DELAY``, and OFF again the moment it is no longer aimed at
+        a live fire -- re-approaching, knocked out of READY, or the target is
+        extinguished -- so the hose never runs while the robot is just driving.
+        Named demo scenes keep full manual <F> control."""
+        if self.external_control or not (self.auto_spray and self.spec is not None):
+            return
+        tf = self.targeted_fire
+        target_out = tf >= len(self.fire_health) or self.fire_health[tf] <= 0
+        aimed = self._approach_ready and not target_out
+        if self.spraying:
+            if not aimed:
+                self.set_spray(False)
+        elif aimed and self._ready_time is not None:
+            if float(self.data.time) - self._ready_time >= READY_SPRAY_DELAY:
+                self.set_spray(True)
 
     def _steer(self):
         """Yaw rate driving heading->heading_target and y->lateral_target.
@@ -846,11 +975,13 @@ class G1Sim:
             self.navigator = None
             self._approach_enabled = False
             self._approach_ready = False
+            self._ready_time = None
             self._manual_yaw = False
             self._blocked = False
             self._blocked_replan_done = False
             self._pos_history.clear()
             self._nav_path = []
+            self._aim_hist = None
             self._reset_state()
         return self.data.qpos[0:3].copy()
 

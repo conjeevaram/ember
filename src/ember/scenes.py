@@ -144,18 +144,29 @@ def _terrain_hfield_line(spec: SceneSpec) -> str:
     return hfield_asset(spec.terrain, spec.name)
 
 
-def _body_extra_from_spec(spec: SceneSpec) -> str:
-    parts = []
+def _static_geoms(spec: SceneSpec) -> list[str]:
+    """Walls, debris and terrain geoms shared by the 12- and 29-DOF scenes."""
+    parts: list[str] = []
     if spec.walls:
         parts.append(wall_geoms(spec.walls))
     if spec.debris:
         parts.append(debris_geoms(spec.debris))
     if spec.terrain is not None:
         parts.append(hfield_geom(spec.terrain, spec.bounds))
+    return parts
+
+
+def _join_geoms(parts: list[str]) -> str:
+    return "\n    ".join(p for p in parts if p)
+
+
+def _body_extra_from_spec(spec: SceneSpec) -> str:
+    """12-DOF physics body: shared static geoms + bright (collidable-free) fire props."""
+    parts = _static_geoms(spec)
     fire_xyz = _fire_positions_xy(spec.fires)
     if fire_xyz:
         parts.append(fire_geom(fire_xyz))
-    return "\n    ".join(p for p in parts if p)
+    return _join_geoms(parts)
 
 
 def _asset_extra_29(spec: SceneSpec, flame_xyz: list[tuple[float, float, float]]) -> str:
@@ -175,17 +186,11 @@ def _asset_extra_29(spec: SceneSpec, flame_xyz: list[tuple[float, float, float]]
 
 def _overlay_body_from_spec(spec: SceneSpec,
                             flame_xyz: list[tuple[float, float, float]]) -> str:
-    """29-DOF overlay: walls + debris + terrain + emissive flames (aligned with physics)."""
-    parts = []
-    if spec.walls:
-        parts.append(wall_geoms(spec.walls))
-    if spec.debris:
-        parts.append(debris_geoms(spec.debris))
-    if spec.terrain is not None:
-        parts.append(hfield_geom(spec.terrain, spec.bounds))
+    """29-DOF overlay: shared static geoms + emissive flames (aligned with physics)."""
+    parts = _static_geoms(spec)
     if flame_xyz:
         parts.append(flame_bodies(flame_xyz))
-    return "\n    ".join(p for p in parts if p)
+    return _join_geoms(parts)
 
 
 def render_from_spec(spec: SceneSpec) -> tuple[str, str]:
@@ -388,11 +393,6 @@ def flame_bodies(positions=None) -> str:
     """
     return "\n    ".join(
         _flame_body_one(i, pos) for i, pos in enumerate(_fire_positions(positions)))
-
-
-def flame_body(pos=FIRE_POSITION_WORLD) -> str:
-    """Single-fire shorthand for :func:`flame_bodies`."""
-    return flame_bodies([pos])
 
 
 def _scene_12(model_label: str, statistic: str, body_extra: str = "",

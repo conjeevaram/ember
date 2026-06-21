@@ -13,6 +13,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from typing import Literal
 
 from . import scenes
 from .config import G1_MODEL_DIR, RENDER_FPS
+from .executor import MissionExecutor
+from .mission import parse_mission
 from .sim import G1Sim, OVERLAY_SCENES, SCENES
 from .spec import from_json
 from .streaming import FrameBuffer, create_app, mjpeg_response, serve
@@ -73,6 +76,7 @@ class SimManager:
         self._current_key = initial_key
         self._physics_thread: threading.Thread | None = None
         self._retired: list[G1Sim] = []
+        self._executor: MissionExecutor | None = None
         self._switch_unlocked(initial_key, first=True)
 
     def current_key(self) -> str:
@@ -108,12 +112,51 @@ class SimManager:
 
     def shutdown(self):
         with self._lock:
+            self._stop_executor_unlocked()
             sim = _SIM
             if sim is not None:
                 sim.stop()
             if self._physics_thread is not None:
                 self._physics_thread.join(timeout=5.0)
                 self._physics_thread = None
+
+    # -- mission executor --------------------------------------------------- #
+
+    def _stop_executor_unlocked(self) -> None:
+        if self._executor is not None:
+            self._executor.stop()
+            self._executor = None
+
+    def start_mission(self, prompt: str) -> dict:
+        """Parse ``prompt`` against the active scene and run it autonomously.
+
+        Missions need a procedural ``SceneSpec`` (the named demos have no
+        costmap). Parsing happens outside the lock so a slow LLM call doesn't
+        stall other requests."""
+        sim = self.sim()
+        if sim.spec is None:
+            return {"error": "missions require a procedural scene"}
+        mission = parse_mission(prompt, sim.spec)
+        tasks = [{"type": t.type.value, "target": t.target} for t in mission]
+        with self._lock:
+            self._stop_executor_unlocked()
+            ex = MissionExecutor(sim, mission)
+            ex.start()
+            self._executor = ex
+        return {"ok": True, "prompt": prompt, "tasks": tasks}
+
+    def mission_status(self) -> dict | None:
+        ex = self._executor
+        return ex.status() if ex is not None else None
+
+    def stop_mission(self) -> None:
+        with self._lock:
+            self._stop_executor_unlocked()
+
+    def preempt_executor(self) -> None:
+        ex = self._executor
+        if ex is not None:
+            ex.preempt()
 
     def _build_sim(self, entry: SceneEntry) -> G1Sim:
         if entry.kind == "proc":
@@ -145,6 +188,7 @@ class SimManager:
 
     def _switch_unlocked(self, key: str, first: bool = False) -> str:
         global _SIM
+        self._stop_executor_unlocked()
         retiring: G1Sim | None = None
         if self._physics_thread is not None:
             retiring = _SIM
@@ -175,189 +219,8 @@ class SimManager:
         return key
 
 
-_PAGE = """<!doctype html><html><head><title>G1 Walk</title>
-<style>body{background:#111;color:#ddd;font-family:monospace;margin:0;text-align:center}
-img{max-width:100%;height:auto;background:#000}
-#hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px;z-index:2}
-#ego{position:fixed;bottom:10px;right:10px;border:2px solid #555;border-radius:4px;background:#000;z-index:2;display:none}
-#ego img{display:block;width:320px}
-#ego .lbl{position:absolute;top:2px;left:6px;font-size:11px;color:#0f0;text-shadow:0 0 3px #000}
-kbd{background:#333;padding:1px 5px;border-radius:3px}
-#sceneSel{margin:4px 0;font-family:monospace;background:#222;color:#ddd;border:1px solid #555}
-#navPanel{position:fixed;top:8px;right:8px;background:rgba(0,0,0,.75);padding:6px;border-radius:4px;z-index:2;text-align:left}
-#navCanvas{background:#1a1a1a;border:1px solid #444;display:block}
-.navRow{font-size:12px;margin:4px 0}
-</style></head>
-<body>
-<div id="hud">
-<b>G1 locomotion</b> (12-DOF walker + kinematic arm overlay)<br>
-scene: <select id="sceneSel"></select><br>
-<kbd>W</kbd>/<kbd>S</kbd> fwd/back &nbsp; <kbd>A</kbd>/<kbd>D</kbd> turn<br>
-<kbd>Q</kbd>/<kbd>E</kbd> strafe &nbsp; <kbd>Space</kbd> stop<br>
-<kbd>H</kbd> auto-steer (re-center) <span id="hh"></span><br>
-<kbd>1</kbd> carry hose &nbsp; <kbd>2</kbd> aim &nbsp; <kbd>3</kbd> arms down &nbsp; arms: <span id="arm">?</span><br>
-<kbd>F</kbd> spray water <span id="spray">[off]</span> &nbsp; <kbd>G</kbd> reignite<br>
-fire: <span id="fire">100%</span> <span id="hit"></span><br>
-cmd: <span id="cmd">0,0,0</span><br>
-<span id="st"></span>
-</div>
-<div id="navPanel">
-<div class="navRow"><b>Nav map</b></div>
-<canvas id="navCanvas" width="280" height="220"></canvas>
-<div class="navRow">
-<button id="approachBtn">Approach fire</button>
-<button id="resetBtn">Reset</button>
-<span id="approachPhase"></span>
-</div>
-</div>
-<img src="/stream"/>
-<div id="ego"><div class="lbl">ROBOT CAM</div><img id="egoImg" src="/camera"/></div>
-<script>
-let vx=0,vy=0,yaw=0,sceneBusy=false,navOcc=null,navMeta=null,navHit=null;
-function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json()).then(d=>{
-  document.getElementById('cmd').textContent=d.cmd.map(x=>x.toFixed(2)).join(', ');});}
-function setApproach(on){
-  fetch('/approach?on='+(on?1:0)).then(r=>r.json()).then(d=>{
-    document.getElementById('approachBtn').disabled=!!d.approach;});}
-function resetPose(){fetch('/reset').then(()=>{setApproach(false);});}
-function phaseLabel(p){
-  if(!p)return '';
-  if(p==='navigate')return 'NAVIGATING\u2026';
-  if(p==='face')return 'FACING\u2026';
-  if(p==='ready')return 'READY \u2713';
-  return p;}
-function drawNav(d){
-  if(!d)return;
-  const c=document.getElementById('navCanvas');
-  const ctx=c.getContext('2d');
-  const w=c.width,h=c.height;
-  const ox=d.origin[0],oy=d.origin[1],res=d.res,nx=d.shape[0],ny=d.shape[1];
-  const meta=ox+'|'+oy+'|'+res+'|'+nx+'|'+ny;
-  if(navMeta!==meta){navMeta=meta;navOcc=d.occupied;}
-  ctx.fillStyle='#111';ctx.fillRect(0,0,w,h);
-  const sx=w/(nx*res),sy=h/(ny*res),sc=Math.min(sx,sy);
-  const padX=(w-nx*res*sc)/2,padY=(h-ny*res*sc)/2;
-  function toX(x){return padX+(x-ox)*sc;}
-  function toY(y){return padY+(ny*res-(y-oy))*sc;}
-  navHit={ox,oy,res,nx,ny,sc,padX,padY,fires:d.fires,targeted:d.targeted_fire};
-  if(navOcc){
-    for(let j=0;j<ny;j++)for(let i=0;i<nx;i++){
-      if(navOcc[j*nx+i]){
-        const x0=toX(ox+i*res),y0=toY(oy+(j+1)*res);
-        ctx.fillStyle='#555';ctx.fillRect(x0,y0,res*sc,res*sc);
-      }
-    }
-  }
-  if(d.home){ctx.fillStyle='#4af';const hx=toX(d.home[0]),hy=toY(d.home[1]);
-    ctx.beginPath();ctx.arc(hx,hy,4,0,6.28);ctx.fill();}
-  d.fires.forEach((f,i)=>{
-    const col=f.health<=0?'#333':(i===d.targeted_fire?'#ff6600':'#ff3333');
-    ctx.fillStyle=col;const fx=toX(f.pos[0]),fy=toY(f.pos[1]);
-    ctx.beginPath();ctx.arc(fx,fy,5,0,6.28);ctx.fill();});
-  if(d.path&&d.path.length>1){
-    ctx.strokeStyle='#0f0';ctx.lineWidth=2;ctx.beginPath();
-    ctx.moveTo(toX(d.path[0][0]),toY(d.path[0][1]));
-    for(let k=1;k<d.path.length;k++)ctx.lineTo(toX(d.path[k][0]),toY(d.path[k][1]));
-    ctx.stroke();
-    const gl=d.path[d.path.length-1],gx=toX(gl[0]),gy=toY(gl[1]);
-    ctx.strokeStyle='#0f0';ctx.lineWidth=2;ctx.beginPath();
-    ctx.arc(gx,gy,7,0,6.28);ctx.stroke();
-    const tf=d.fires[d.targeted_fire];
-    if(tf&&tf.health>0){
-      const ffx=toX(tf.pos[0]),ffy=toY(tf.pos[1]);
-      ctx.setLineDash([4,3]);ctx.strokeStyle='#888';ctx.lineWidth=1;
-      ctx.beginPath();ctx.moveTo(gx,gy);ctx.lineTo(ffx,ffy);ctx.stroke();
-      ctx.setLineDash([]);}}
-  ctx.fillStyle='#ccc';ctx.font='11px monospace';
-  ctx.fillText('target: fire '+d.targeted_fire,6,h-6);
-  const rp=d.robot.pos,ryaw=d.robot.yaw;
-  let rx=toX(rp[0]),ry=toY(rp[1]);
-  const oob=(rx<2||rx>w-2||ry<2||ry>h-2);
-  rx=Math.max(6,Math.min(w-6,rx));ry=Math.max(6,Math.min(h-6,ry));
-  const rcol=oob?'#ff3333':'#00ffcc';
-  ctx.fillStyle=rcol;ctx.beginPath();ctx.arc(rx,ry,5,0,6.28);ctx.fill();
-  ctx.strokeStyle=rcol;ctx.beginPath();
-  ctx.moveTo(rx,ry);ctx.lineTo(rx+12*Math.cos(ryaw),ry-12*Math.sin(ryaw));ctx.stroke();
-  if(oob){ctx.fillStyle='#ff3333';ctx.font='10px monospace';ctx.fillText('off-map \u2192 Reset',6,12);}
-  document.getElementById('approachBtn').disabled=!!d.approach;
-  document.getElementById('approachPhase').textContent=phaseLabel(d.phase);}
-document.getElementById('navCanvas').addEventListener('click',e=>{
-  if(!navHit)return;
-  const c=document.getElementById('navCanvas');
-  const rect=c.getBoundingClientRect();
-  const mx=e.clientX-rect.left,my=e.clientY-rect.top;
-  const {ox,oy,res,nx,ny,sc,padX,padY,fires}=navHit;
-  function toX(x){return padX+(x-ox)*sc;}
-  function toY(y){return padY+(ny*res-(y-oy))*sc;}
-  let best=-1,bestD=1e9;
-  fires.forEach((f,i)=>{
-    if(f.health<=0)return;
-    const fx=toX(f.pos[0]),fy=toY(f.pos[1]);
-    const dist=Math.hypot(mx-fx,my-fy);
-    if(dist<8&&dist<bestD){bestD=dist;best=i;}});
-  if(best>=0)fetch('/target?idx='+best);});
-function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
-  document.getElementById('arm').textContent=d.arm_pose;});}
-function setEgo(on){
-  document.getElementById('ego').style.display=on?'block':'none';}
-function loadScenes(){
-  fetch('/scenes').then(r=>r.json()).then(d=>{
-    const sel=document.getElementById('sceneSel');
-    sel.innerHTML='';
-    d.scenes.forEach(s=>{
-      const o=document.createElement('option');
-      o.value=s.key; o.textContent=s.label;
-      if(s.key===d.current) o.selected=true;
-      sel.appendChild(o);});
-    setEgo(!!d.has_camera);});}
-function switchScene(key){
-  if(sceneBusy)return;
-  sceneBusy=true;
-  fetch('/scene?key='+encodeURIComponent(key)).then(r=>{
-    if(!r.ok) throw new Error('switch failed');
-    return r.json();}).then(d=>{
-    setEgo(!!d.has_camera);
-    vx=vy=yaw=0; send();
-    navOcc=null;navMeta=null;setApproach(false);}).catch(()=>{
-    loadScenes();}).finally(()=>{sceneBusy=false;});}
-document.getElementById('sceneSel').addEventListener('change',e=>{
-  switchScene(e.target.value);});
-document.addEventListener('keydown',e=>{
-  if(e.repeat)return;
-  switch(e.key.toLowerCase()){
-    case'w':vx=0.8;break; case's':vx=-0.4;break;
-    case'a':yaw=0.6;break; case'd':yaw=-0.6;break;
-    case'q':vy=0.3;break;  case'e':vy=-0.3;break;
-    case' ':vx=vy=yaw=0;setApproach(false);break;
-    case'h':fetch('/heading?on=1').then(r=>r.json()).then(d=>{
-      document.getElementById('hh').textContent=d.heading_hold?'[ON]':'[off]';});return;
-    case'1':setArm('carry');return; case'2':setArm('aim');return;
-    case'3':setArm('down');return;
-    case'f':fetch('/spray').then(r=>r.json()).then(d=>{
-      document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';});return;
-    case'g':fetch('/reignite');return;
-    default:return;}
-  send();});
-document.addEventListener('keyup',e=>{
-  switch(e.key.toLowerCase()){
-    case'w':case's':vx=0;break;
-    case'a':case'd':yaw=0;break;
-    case'q':case'e':vy=0;break; default:return;}
-  send();});
-document.getElementById('approachBtn').addEventListener('click',()=>{setApproach(true);});
-document.getElementById('resetBtn').addEventListener('click',resetPose);
-setInterval(()=>{fetch('/nav').then(r=>r.json()).then(d=>{if(d&&!d.error)drawNav(d);});},500);
-setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
-  if(d.arm_pose)document.getElementById('arm').textContent=d.arm_pose;
-  document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';
-  document.getElementById('fire').textContent=Math.round(d.fire_health*100)+'%';
-  document.getElementById('hit').textContent=
-    d.fire_health<=0?'\u2713 OUT':(d.spraying?(d.hitting?'\u25c9 HIT':'\u2715 MISS'):'');
-  document.getElementById('st').textContent=
-    `pos ${d.pos.map(x=>x.toFixed(2))} ${d.fell?'\u26a0 FELL':'ok'}${d.blocked?' BLOCKED':''}`+
-    (d.approach_phase?' '+phaseLabel(d.approach_phase):'');});},500);
-loadScenes();
-</script></body></html>"""
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+_PAGE = (_WEB_DIR / "console.html").read_text(encoding="utf-8")
 
 
 def _make_app(mgr: SimManager):
@@ -369,6 +232,7 @@ def _make_app(mgr: SimManager):
             def f(name):
                 v = request.args.get(name)
                 return float(v) if v is not None else None
+            mgr.preempt_executor()  # manual drive overrides an autonomous mission
             c = mgr.sim().set_command(vx=f("vx"), vy=f("vy"), yaw=f("yaw"))
             return jsonify(cmd=c.tolist())
 
@@ -392,6 +256,14 @@ def _make_app(mgr: SimManager):
         @app.route("/reignite")
         def reignite():
             return jsonify(fire_health=mgr.sim().reignite())
+
+        @app.route("/wind")
+        def wind_toggle():
+            arg = request.args.get("on")
+            sim = mgr.sim()
+            on = (not sim.wind_enabled) if arg is None else arg not in ("0", "false", "")
+            sim.enable_wind(on)
+            return jsonify(wind_enabled=sim.wind_enabled)
 
         @app.route("/scenes")
         def scenes_list():
@@ -425,7 +297,25 @@ def _make_app(mgr: SimManager):
 
         @app.route("/reset")
         def reset_pose():
+            mgr.stop_mission()
             return jsonify(pos=mgr.sim().reset_to_start().tolist())
+
+        @app.route("/mission")
+        def mission_start():
+            prompt = (request.args.get("prompt") or "").strip()
+            if not prompt:
+                return jsonify(error="missing prompt"), 400
+            result = mgr.start_mission(prompt)
+            return jsonify(result), (400 if "error" in result else 200)
+
+        @app.route("/mission_status")
+        def mission_status():
+            return jsonify(mgr.mission_status() or {"running": False})
+
+        @app.route("/mission_stop")
+        def mission_stop():
+            mgr.stop_mission()
+            return jsonify(stopped=True)
 
         @app.route("/target")
         def target_fire():
@@ -443,6 +333,8 @@ def _make_app(mgr: SimManager):
     def state_fn():
         s = mgr.sim().get_state()
         return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
+                    lin_vel=s["lin_vel"].tolist(), wind=s.get("wind", [0.0, 0.0]),
+                    wind_enabled=bool(mgr.sim().wind_enabled),
                     fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
                     arm_pose=s["arm_pose"], spraying=bool(s["spraying"]),
                     hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]),
@@ -456,12 +348,33 @@ def _make_app(mgr: SimManager):
                       state_fn=state_fn, register_routes=register)
 
 
+def _load_dotenv() -> None:
+    """Load ``KEY=VALUE`` lines from the repo-root ``.env`` into ``os.environ``
+    (without overwriting anything already set).
+
+    Lets *any* launcher -- ``python -m ember.viewer``, a teammate's restart, or
+    a programmatic call -- pick up secrets like ``GEMINI_API_KEY`` so the LLM
+    mission parser stays enabled without remembering to ``source .env``."""
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
 def start(block=True, serve_web=True, port=8088, render=True, initial_cmd=None,
           scene="flat", loop=False, overlay=True, spec=None):
     """Start the sim. With block=False, runs the loop on a background thread.
 
     Pass a ``SceneSpec`` via ``spec`` to run a procedural scene: the XMLs are
     (re)built from it and the robot spawns at ``spec.start``."""
+    _load_dotenv()
     initial_key = spec.name if spec is not None else (
         scene if scene in SCENES else "flat")
 

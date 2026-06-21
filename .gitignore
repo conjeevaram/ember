@@ -16,14 +16,18 @@ MUJOCO_LOG.TXT
 *.log
 mujoco_videos/
 
-# Training setup + outputs (live on the 5090, not in the repo)
+# Training setup + outputs (live on the GPU box, not in the repo)
 train_5090/
+train_5070ti/
 *.mp4
 *.npz
 *.pkl
 
 # Generated procedural scenes (reproducible via scripts/build_scenes.py --random)
 scenes/
+
+# Secrets / local env (API keys — never commit)
+.env
 
 # Editor / OS
 .DS_Store

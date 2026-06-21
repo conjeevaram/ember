@@ -27,19 +27,26 @@ def _flame_light_names(index: int) -> tuple[str, str]:
     return f"firelight{index}a", f"firelight{index}b"
 
 
-def trajectory(muzzle, direction, speed, *, ground_z=0.0, dt=0.02, max_steps=200):
+def trajectory(muzzle, direction, speed, *, ground_z=0.0, dt=0.02, max_steps=200,
+               wind=(0.0, 0.0)):
     """Ballistic path of a water parcel launched from ``muzzle`` along the unit
     ``direction`` at ``speed`` (m/s), under gravity, until it drops to
     ``ground_z``. Returns ``(points Nx3, landing 3)`` -- the real arc, so it
-    overshoots / falls short / veers off when the nozzle is mis-aimed."""
+    overshoots / falls short / veers off when the nozzle is mis-aimed.
+
+    ``wind`` is a constant horizontal acceleration ``(ax, ay)`` (m/s^2) on the
+    light water parcel; it deflects the jet more the longer it is airborne, so
+    the deflection grows with throw distance. Default ``(0, 0)`` keeps the
+    deterministic (wind-off) behaviour."""
     muzzle = np.asarray(muzzle, float)
     d = np.asarray(direction, float)
     d = d / (np.linalg.norm(d) + 1e-9)
     vel = d * speed
+    acc = np.array([wind[0], wind[1], -GRAVITY])
     p = muzzle.copy()
     pts = [p.copy()]
     for _ in range(max_steps):
-        vel = vel + np.array([0.0, 0.0, -GRAVITY]) * dt
+        vel = vel + acc * dt
         p = p + vel * dt
         pts.append(p.copy())
         if p[2] <= ground_z:

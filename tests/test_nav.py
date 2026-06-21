@@ -18,7 +18,7 @@ from ember.nav import (
     NAV_RES,
     SPRAY_STANDOFF,
     astar,
-    best_standoff,
+    clear_shot,
     line_of_sight,
     nearest_burning_fire,
     point_in_any_wall,
@@ -186,27 +186,6 @@ def _all_test_specs() -> list[SceneSpec]:
         specs.append(scenegen.random_spec(seed + 5000, n_fires=2 + seed % 2,
                                           n_walls=2 + seed % 3, n_debris=2))
     return specs
-
-
-def test_best_standoff_all_specs():
-    failures = []
-    for spec in _all_test_specs():
-        cm = Costmap.from_spec(spec)
-        sx, sy = spec.start[0], spec.start[1]
-        for fi, (fx, fy) in enumerate(spec.fires):
-            pt = best_standoff(cm, fx, fy, sx, sy)
-            if pt is None:
-                failures.append((spec.name, fi, "none"))
-                continue
-            if not cm.is_free_world(pt[0], pt[1]):
-                failures.append((spec.name, fi, "occupied"))
-            path = astar(cm, (sx, sy), pt)
-            if not path:
-                failures.append((spec.name, fi, "no_path"))
-            dist = math.hypot(pt[0] - fx, pt[1] - fy)
-            if abs(dist - SPRAY_STANDOFF) > cm.res * 2:
-                failures.append((spec.name, fi, f"dist={dist:.2f}"))
-    assert failures == [], f"best_standoff failed: {failures[:10]}"
 
 
 def test_nearest_burning_fire_selection():
@@ -378,6 +357,52 @@ def test_safe_spray_point_all_specs():
         if abs(dist - SPRAY_STANDOFF) > cm.res * 2 + 0.05:
             failures.append((spec.name, f"dist={dist:.2f}"))
     assert failures == [], f"safe_spray_point failed: {failures[:10]}"
+
+
+def _wall_costmap(walls, bounds=(0.0, 9.0, 0.0, 8.0), res=0.1,
+                  inflation=NAV_INFLATION) -> Costmap:
+    """Costmap built from raw wall footprints (same rasterization as from_spec)."""
+    xmin, xmax, ymin, ymax = bounds
+    nx = int(math.ceil((xmax - xmin) / res))
+    ny = int(math.ceil((ymax - ymin) / res))
+    grid = np.zeros((ny, nx), dtype=bool)
+    for j in range(ny):
+        wy = ymin + (j + 0.5) * res
+        for i in range(nx):
+            wx = xmin + (i + 0.5) * res
+            if point_in_any_wall(wx, wy, walls, inflation):
+                grid[j, i] = True
+    return Costmap(grid, xmin, ymin, res, walls=tuple(walls))
+
+
+def test_clear_shot_blocks_wall_crossing():
+    wall = (2.0, 2.0, 0.4, 4.0, 0.0)  # thin vertical wall at x~2, y 0..4
+    cm = _wall_costmap((wall,), bounds=(0.0, 6.0, 0.0, 6.0))
+    # A segment crossing the wall is blocked; one in the open lane is clear.
+    assert not clear_shot(cm, 0.5, 2.0, 3.5, 2.0)
+    assert clear_shot(cm, 3.0, 5.0, 5.0, 5.0)
+    # No walls -> nothing can block the jet.
+    empty = Costmap(np.zeros((6, 6), dtype=bool), 0.0, 0.0, 1.0)
+    assert clear_shot(empty, 0.0, 0.0, 5.0, 5.0)
+
+
+def test_safe_spray_point_avoids_spraying_through_wall():
+    # Wall sits directly between the robot's start and the fire: the naive
+    # "straight back from the fire toward me" standoff would spray through it.
+    wall = (4.0, 4.0, 0.4, 4.0, 0.0)
+    cm = _wall_costmap((wall,))
+    fire = (5.0, 4.0)
+    start = (3.0, 4.0)
+    naive = standoff_point(fire[0], fire[1], start[0], start[1])
+    assert not clear_shot(cm, naive[0], naive[1], fire[0], fire[1]), \
+        "test scene invalid: naive standoff should be wall-blocked"
+
+    pt = safe_spray_point(cm, fire, [fire], start, target_idx=0)
+    assert pt is not None
+    assert clear_shot(cm, pt[0], pt[1], fire[0], fire[1]), \
+        "chosen spray point sprays through the wall"
+    assert astar(cm, start, pt), "chosen spray point is unreachable"
+    assert abs(math.hypot(pt[0] - fire[0], pt[1] - fire[1]) - SPRAY_STANDOFF) < 0.2
 
 
 @pytest.mark.skipif(

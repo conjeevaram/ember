@@ -17,9 +17,21 @@ dependencies = [
     "flask>=3.0",
 ]
 
+[project.optional-dependencies]
+train = [
+    "gymnasium>=0.29",
+    "stable-baselines3>=2.3",
+]
+llm = [
+    "google-genai>=1.0",
+]
+
 [project.scripts]
 ember-walk = "ember.viewer:main"
 ember-build-scenes = "ember.scenes:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ember = ["web/*.html"]
