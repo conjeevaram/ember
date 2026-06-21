@@ -95,7 +95,8 @@ class SceneFX:
         for i, flame in enumerate(self._flames):
             h = max(health_list[i] if i < len(health_list) else 0.0, 0.0)
             gslice = flame["gslice"]
-            model.geom_size[gslice] = flame["base_size"] * (0.15 + 0.85 * h)
+            scale = (0.15 + 0.85 * h) if h > 0.02 else 0.0  # fully hide when out
+            model.geom_size[gslice] = flame["base_size"] * scale
             model.geom_pos[gslice] = (
                 flame["base_pos"] + r.normal(0, 0.02 * h, flame["base_pos"].shape))
             for lid in flame["lights"]:
