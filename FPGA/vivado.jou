@@ -23,3 +23,10 @@
 #-----------------------------------------------------------
 start_gui
 open_project C:/Users/dhyey/Desktop/ember/FPGA/Fire_Detection_Accelerator.xpr
+update_compile_order -fileset sources_1
+launch_simulation
+source tb_top.tcl
+add_files -norecurse C:/Users/dhyey/Desktop/ember/FPGA/img_srcs/sim_imgs/pjeevy1.mem
+close_sim
+launch_simulation
+source tb_top.tcl
