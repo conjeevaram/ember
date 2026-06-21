@@ -5,7 +5,7 @@
 """
 import _bootstrap  # noqa: F401  (puts src/ on the path)
 
-from ember.locomotion import main
+from ember.viewer import main
 
 if __name__ == "__main__":
     main()

@@ -3,31 +3,22 @@
 Physics: Unitree's pretrained 12-DOF lower-body locomotion policy
 (``deploy/pre_train/g1/motion.pt``) in a plain MuJoCo sim. Its command vector is
 exactly ``(vx, vy, yaw_rate)``, so velocity control reduces to writing that
-vector -- see :meth:`G1Sim.set_command` / :func:`send_velocity_command`.
+vector -- see :meth:`G1Sim.set_command`.
 
 Arms: the 12-DOF model's arms are welded decoration, so for rendering we drive a
 full 29-DOF (with hands) body whose base + 12 legs are copied from the physics
 sim every frame, with the arms posed kinematically (carry hose / aim) -- an
 articulated, posable upper body on the bulletproof walker, no extra physics.
 
-Run:
-    python -m ember.locomotion --scene obstacles
-    ember-walk --scene obstacles            # if installed
-
-Programmatic (for the fire controller):
-    from ember import locomotion
-    locomotion.start(block=False, scene="obstacles")
-    locomotion.send_velocity_command(vx=0.5, yaw=0.2)
-    state = locomotion.get_state()
+The interactive web viewer that hot-swaps and serves this sim lives in
+:mod:`ember.viewer`.
 """
 from __future__ import annotations
 
 import math
 import threading
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
+from collections import deque
 
 import mujoco
 import numpy as np
@@ -38,7 +29,7 @@ from . import arms, effects, scenes
 from .config import (CAM_FOVY, CAM_H, CAM_W, DEPLOY_CONFIG_PATH, G1_MODEL_DIR,
                      POLICY_PATH, RENDER_FPS, RENDER_H, RENDER_W, VX_RANGE,
                      VY_RANGE, YAW_RANGE, clamp, gravity_orientation, quat_yaw)
-from .streaming import FrameBuffer, create_app, encode_jpeg, mjpeg_response, serve
+from .streaming import FrameBuffer, encode_jpeg
 
 # Ego ("helmet") camera mount, in the torso_link frame: a bit forward and up to
 # head height, looking forward and tilted down to see the ground ahead.
@@ -75,6 +66,10 @@ NOZZLE_REST_PITCH = -0.08  # fixed ~level elevation (no auto-aim)
 FIRE_AIM_HEIGHT = 0.45
 HIT_RADIUS = 0.25
 EXTINGUISH_TIME = 10.0
+
+BLOCKED_WINDOW = 2.0
+BLOCKED_DISP_THRESH = 0.05
+BLOCKED_CMD_THRESH = 0.05
 
 
 def _y_quat(phi: float) -> list[float]:
@@ -231,7 +226,13 @@ class G1Sim:
         else:
             self.fire_positions = [scenes.FIRE_POSITION_WORLD]
         self.fire_health = [1.0] * len(self.fire_positions)  # 1 = burning, 0 = out
-        self.targeted_fire = 0               # index of the fire the jet engages
+        if spec is not None:
+            from .nav import nearest_burning_fire
+            idx = nearest_burning_fire(spec.fires, self.fire_health,
+                                       spec.start[0], spec.start[1])
+            self.targeted_fire = idx if idx is not None else 0
+        else:
+            self.targeted_fire = 0
         self._hitting = False                # is the jet currently on the fire?
         self.fx = None                   # effects.SceneFX (fire scene only)
         self._hose_bid = -1
@@ -255,10 +256,21 @@ class G1Sim:
         self.cam_frames = FrameBuffer()
         self._cmd_lock = threading.Lock()
         self._running = False
+        self.navigator = None
+        self._approach_enabled = False
+        self._approach_ready = False
+        self._nav_costmap = None
+        self._nav_path: list[tuple[float, float]] = []
+        self._blocked = False
+        self._pos_history: deque[tuple[float, float, float]] = deque()
+        self._blocked_replan_done = False
 
     # -- public control API ------------------------------------------------- #
-    def set_command(self, vx=None, vy=None, yaw=None):
+    def set_command(self, vx=None, vy=None, yaw=None, _nav=False):
         with self._cmd_lock:
+            if not _nav:
+                self.navigator = None
+                self._approach_ready = False
             if vx is not None:
                 self.cmd[0] = clamp(vx, *VX_RANGE)
             if vy is not None:
@@ -280,9 +292,9 @@ class G1Sim:
 
         ``pose`` is either a preset name -- ``'carry'`` (hold hose), ``'aim'``,
         ``'down'`` -- or a dict of ``{joint_name: angle_rad}`` for continuous
-        control (the fire controller's actuator handle). Joint names may omit
-        the ``_joint`` suffix; unspecified arm joints go to 0. Invalid input is
-        ignored (the previous pose is kept). Returns the active pose."""
+        control. Joint names may omit the ``_joint`` suffix; unspecified arm
+        joints go to 0. Invalid input is ignored (the previous pose is kept).
+        Returns the active pose."""
         if isinstance(pose, str):
             if pose in arms.ARM_POSES:
                 self.overlay_arm_pose = pose
@@ -326,7 +338,194 @@ class G1Sim:
                       for p, h in zip(self.fire_positions, self.fire_health)],
             "targeted_fire": self.targeted_fire,
             "fire_health": self.fire_health[self.targeted_fire],
+            "blocked": self._blocked,
+            "approach_phase": (self.navigator.phase
+                               if self._is_approach_controller()
+                               else ("ready" if self._approach_ready else None)),
         }
+
+    # -- navigation / autonomous approach ----------------------------------- #
+    def _ensure_nav_costmap(self) -> None:
+        if self._nav_costmap is None and self.spec is not None:
+            from .nav import Costmap
+            self._nav_costmap = Costmap.from_spec(self.spec)
+
+    def _is_approach_controller(self) -> bool:
+        from .nav import ApproachController
+        return isinstance(self.navigator, ApproachController)
+
+    def _advance_targeted_fire(self) -> None:
+        from .nav import nearest_burning_fire
+        x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
+        nxt = nearest_burning_fire(self.fire_positions, self.fire_health, x, y)
+        if nxt is None:
+            return
+        if nxt == self.targeted_fire:
+            return
+        self.targeted_fire = nxt
+        self._nav_path = []
+        self._replan_approach_if_active()
+
+    def _replan_approach_if_active(self) -> None:
+        if not self._approach_enabled:
+            return
+        if not self.set_approach(True):
+            self.navigator = None
+            self._approach_enabled = False
+
+    def set_targeted_fire(self, idx: int) -> int:
+        if idx < 0 or idx >= len(self.fire_positions):
+            return self.targeted_fire
+        if self.fire_health[idx] <= 0:
+            return self.targeted_fire
+        self.targeted_fire = idx
+        self._nav_path = []
+        self._replan_approach_if_active()
+        return self.targeted_fire
+
+    def _nav_spray_goal(self) -> tuple[float, float] | None:
+        if self._is_approach_controller():
+            return self.navigator.spray_goal
+        if self.spec is None:
+            return None
+        self._ensure_nav_costmap()
+        from .nav import safe_spray_point
+        cm = self._nav_costmap
+        if cm is None:
+            return None
+        state = self.get_state()
+        x, y = float(state["pos"][0]), float(state["pos"][1])
+        tf = int(state["targeted_fire"])
+        fx, fy = self.fire_positions[tf][0], self.fire_positions[tf][1]
+        return safe_spray_point(cm, (fx, fy), self.fire_positions, (x, y),
+                                target_idx=tf)
+
+    def plan_nav_path(self) -> list[tuple[float, float]]:
+        """A* from current pose to safe spray point; caches costmap + path."""
+        if self.spec is None:
+            self._nav_costmap = None
+            self._nav_path = []
+            return []
+        if self._is_approach_controller():
+            return list(self.navigator.path)
+        self._ensure_nav_costmap()
+        from .nav import astar
+        cm = self._nav_costmap
+        state = self.get_state()
+        x, y = float(state["pos"][0]), float(state["pos"][1])
+        goal = self._nav_spray_goal()
+        if goal is None:
+            self._nav_path = []
+            return []
+        self._nav_path = astar(cm, (x, y), goal)
+        return self._nav_path
+
+    def set_approach(self, on: bool) -> bool:
+        """Autonomously approach targeted fire: navigate, face, ready."""
+        self._approach_enabled = bool(on)
+        self._approach_ready = False
+        if not self._approach_enabled:
+            self.navigator = None
+            return False
+        if self.spec is None:
+            self._approach_enabled = False
+            return False
+        from .nav import ApproachController, astar, nearest_burning_fire, safe_spray_point
+        self._ensure_nav_costmap()
+        cm = self._nav_costmap
+        if cm is None:
+            self._approach_enabled = False
+            return False
+        tf = self.targeted_fire
+        if tf >= len(self.fire_health) or self.fire_health[tf] <= 0:
+            nxt = nearest_burning_fire(
+                self.fire_positions, self.fire_health,
+                float(self.data.qpos[0]), float(self.data.qpos[1]))
+            if nxt is None:
+                self._approach_enabled = False
+                return False
+            self.targeted_fire = nxt
+            tf = nxt
+        x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
+        fx, fy = self.fire_positions[tf][0], self.fire_positions[tf][1]
+        goal = safe_spray_point(cm, (fx, fy), self.fire_positions, (x, y), target_idx=tf)
+        if goal is None:
+            self._approach_enabled = False
+            return False
+        path = astar(cm, (x, y), goal)
+        if not path:
+            self._approach_enabled = False
+            return False
+        self._nav_path = path
+        self.navigator = ApproachController(self, path, (fx, fy), tf)
+        self.heading_hold = False
+        self._manual_yaw = False
+        return True
+
+    def nav_snapshot(self) -> dict | None:
+        """Top-down nav overlay payload for the web viewer."""
+        if self.spec is None:
+            return None
+        self._ensure_nav_costmap()
+        cm = self._nav_costmap
+        if cm is None:
+            return None
+        state = self.get_state()
+        if self._is_approach_controller():
+            path = self.navigator.path
+            phase = self.navigator.phase
+            spray_goal = self.navigator.spray_goal
+        elif self._approach_enabled and self.navigator is not None:
+            path = self.navigator.path
+            phase = None
+            spray_goal = getattr(self.navigator, "spray_goal", None)
+        else:
+            path = self.plan_nav_path()
+            phase = None
+            spray_goal = self._nav_spray_goal()
+        ny, nx = cm.shape
+        occ = cm.occupied.reshape(-1).tolist()
+        yaw = quat_yaw(state["quat"])
+        return {
+            "origin": [cm.xmin, cm.ymin],
+            "res": cm.res,
+            "shape": [nx, ny],
+            "occupied": occ,
+            "path": [[p[0], p[1]] for p in path],
+            "spray_goal": list(spray_goal) if spray_goal else None,
+            "phase": phase,
+            "fires": [{"pos": list(f["pos"]), "health": float(f["health"])}
+                      for f in state["fires"]],
+            "home": list(self.spec.home),
+            "robot": {"pos": state["pos"].tolist(), "yaw": float(yaw)},
+            "targeted_fire": int(state["targeted_fire"]),
+            "approach": bool(self._approach_enabled),
+        }
+
+    def _update_blocked(self) -> None:
+        t = float(self.data.time)
+        x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
+        self._pos_history.append((t, x, y))
+        while self._pos_history and t - self._pos_history[0][0] > BLOCKED_WINDOW:
+            self._pos_history.popleft()
+
+        with self._cmd_lock:
+            cmd = self.cmd.copy()
+        commanded = (self._approach_enabled or self.navigator is not None
+                     or abs(float(cmd[0])) > BLOCKED_CMD_THRESH
+                     or abs(float(cmd[1])) > BLOCKED_CMD_THRESH)
+
+        if not commanded or len(self._pos_history) < 2:
+            self._blocked = False
+            return
+
+        t0, x0, y0 = self._pos_history[0]
+        if t - t0 < BLOCKED_WINDOW * 0.9:
+            self._blocked = False
+            return
+
+        disp = math.hypot(x - x0, y - y0)
+        self._blocked = disp < BLOCKED_DISP_THRESH
 
     # -- robot ego camera ---------------------------------------------------- #
     @property
@@ -463,8 +662,7 @@ class G1Sim:
     def _update_jet(self):
         """Per-frame water ballistics, hit test and extinguish progress (fire
         scene only). Caches the jet path so the ego view draws the same arc. The
-        nozzle sits at a fixed elevation -- there is no closed-loop aiming here;
-        that's the fire controller's job (still a stub)."""
+        nozzle sits at a fixed elevation -- there is no closed-loop aiming."""
         self._water = self._water_landing = self._water_hit_idx = None
         self._hitting = False
         if not (self.fx and self.fx.active and self.spraying):
@@ -486,6 +684,8 @@ class G1Sim:
         if hit:
             self.fire_health[tidx] = max(
                 0.0, health - 1.0 / (EXTINGUISH_TIME * RENDER_FPS))
+            if health > 0.0 and self.fire_health[tidx] <= 0.0:
+                self._advance_targeted_fire()
 
     def _decorate(self, scene):
         fires = list(zip(self.fire_positions, self.fire_health))
@@ -572,8 +772,34 @@ class G1Sim:
                     mujoco.mj_step(self.model, self.data)
                     self.counter += 1
 
-                if self.heading_hold and not self._manual_yaw:
+                if self.navigator is not None:
+                    if self.navigator.update():
+                        if (self._is_approach_controller()
+                                and self.navigator.phase == "ready"):
+                            self._approach_ready = True
+                        self.navigator = None
+                        self._approach_enabled = False
+                elif self.heading_hold and not self._manual_yaw:
                     self.cmd[2] = self._steer()
+                self._update_blocked()
+                if (self._approach_enabled and self._blocked
+                        and not self._blocked_replan_done):
+                    if self._is_approach_controller():
+                        if not self.navigator.replan():
+                            self.navigator = None
+                            self._approach_enabled = False
+                    else:
+                        old_path = list(self.navigator.path) if self.navigator else []
+                        path = self.plan_nav_path()
+                        if path and path != old_path:
+                            from .nav import WaypointFollower
+                            self.navigator = WaypointFollower(self, path)
+                        else:
+                            self.navigator = None
+                            self._approach_enabled = False
+                    self._blocked_replan_done = True
+                elif not self._blocked:
+                    self._blocked_replan_done = False
                 self._compute_action()
                 self._fell = self.data.qpos[2] < 0.4
 
@@ -591,7 +817,12 @@ class G1Sim:
             self._release_render()
 
     def _steer(self):
-        """Yaw rate driving heading->heading_target and y->lateral_target."""
+        """Yaw rate driving heading->heading_target and y->lateral_target.
+
+        Only meaningful on the flat/obstacle demo corridors; procedural scenes
+        manage heading via the navigator, so hold the current heading there."""
+        if self.spec is not None:
+            return 0.0
         yaw = quat_yaw(self.data.qpos[3:7])
         heading_err = np.arctan2(np.sin(self.heading_target - yaw),
                                  np.cos(self.heading_target - yaw))
@@ -608,6 +839,21 @@ class G1Sim:
         self._fell = False
         mujoco.mj_forward(self.model, self.data)
 
+    def reset_to_start(self):
+        """Teleport the robot back to its spawn pose and clear autonomy state."""
+        with self._cmd_lock:
+            self.cmd[:] = 0.0
+            self.navigator = None
+            self._approach_enabled = False
+            self._approach_ready = False
+            self._manual_yaw = False
+            self._blocked = False
+            self._blocked_replan_done = False
+            self._pos_history.clear()
+            self._nav_path = []
+            self._reset_state()
+        return self.data.qpos[0:3].copy()
+
     def stop(self):
         self._running = False
 
@@ -618,408 +864,3 @@ class G1Sim:
         self.render_model = None
         self.render_data = None
         self.fx = None
-
-
-# --------------------------------------------------------------------------- #
-# Scene catalog + hot-swap manager
-# --------------------------------------------------------------------------- #
-_SPECS_DIR = Path(__file__).resolve().parent.parent.parent / "scenes" / "specs"
-_NAMED_LABELS = {"flat": "flat", "obstacles": "obstacles", "fire": "fire"}
-
-
-@dataclass(frozen=True)
-class SceneEntry:
-    key: str
-    label: str
-    kind: Literal["named", "proc"]
-    scene: str | None = None
-    spec_path: Path | None = None
-
-
-def discover_scene_catalog() -> list[SceneEntry]:
-    """Named demos plus every ``scenes/specs/*.json`` (sorted)."""
-    entries = [
-        SceneEntry(key=k, label=_NAMED_LABELS[k], kind="named", scene=k)
-        for k in ("flat", "obstacles", "fire")
-    ]
-    if _SPECS_DIR.is_dir():
-        from .spec import from_json
-        for path in sorted(_SPECS_DIR.glob("*.json")):
-            spec = from_json(path)
-            entries.append(SceneEntry(
-                key=spec.name, label=spec.name, kind="proc", spec_path=path))
-    return entries
-
-
-class SimManager:
-    """Owns the active :class:`G1Sim` and hot-swaps scenes under a lock."""
-
-    def __init__(self, initial_key: str, *, overlay=True, render=True,
-                 loop=False, initial_cmd=None):
-        self._lock = threading.Lock()
-        self._overlay = overlay
-        self._render = render
-        self._loop = loop
-        self._initial_cmd = initial_cmd
-        self.catalog = discover_scene_catalog()
-        self._by_key = {e.key: e for e in self.catalog}
-        if initial_key not in self._by_key:
-            raise ValueError(f"unknown scene key: {initial_key}")
-        self._current_key = initial_key
-        self._physics_thread: threading.Thread | None = None
-        self._retired: list[G1Sim] = []
-        self._switch_unlocked(initial_key, first=True)
-
-    def current_key(self) -> str:
-        with self._lock:
-            return self._current_key
-
-    def catalog_list(self) -> list[dict]:
-        return [{"key": e.key, "label": e.label} for e in self.catalog]
-
-    def sim(self) -> G1Sim:
-        with self._lock:
-            if _SIM is None:
-                raise RuntimeError("no active sim")
-            return _SIM
-
-    def frames(self) -> FrameBuffer:
-        return self.sim().frames
-
-    def cam_frames(self) -> FrameBuffer | None:
-        sim = self.sim()
-        return sim.cam_frames if sim.has_camera else None
-
-    def has_camera(self) -> bool:
-        return self.sim().has_camera
-
-    def switch(self, key: str) -> str:
-        with self._lock:
-            if key not in self._by_key:
-                raise ValueError(f"unknown scene key: {key}")
-            if key == self._current_key:
-                return key
-            return self._switch_unlocked(key)
-
-    def shutdown(self):
-        with self._lock:
-            sim = _SIM
-            if sim is not None:
-                sim.stop()
-            if self._physics_thread is not None:
-                self._physics_thread.join(timeout=5.0)
-                self._physics_thread = None
-
-    def _build_sim(self, entry: SceneEntry) -> G1Sim:
-        if entry.kind == "proc":
-            from .spec import from_json
-            spec = from_json(entry.spec_path)
-            scenes.build(spec)
-            name_12, name_29 = scenes.spec_scene_names(spec.name)
-            scene_path = str(G1_MODEL_DIR / name_12)
-            overlay = (str(G1_MODEL_DIR / name_29)
-                       if self._overlay else None)
-            return G1Sim(scene_path=scene_path, overlay_scene=overlay, spec=spec)
-        scenes.ensure_scenes()
-        scene_path = SCENES[entry.scene]
-        overlay = (OVERLAY_SCENES.get(scene_path) if self._overlay else None)
-        return G1Sim(scene_path=scene_path, overlay_scene=overlay)
-
-    def _apply_policy(self, sim: G1Sim, entry: SceneEntry):
-        if entry.kind == "proc":
-            sim.auto_reset = False
-            sim.heading_hold = False
-            sim.set_command(0.0, 0.0, 0.0)
-        elif entry.scene == "obstacles":
-            sim.auto_reset = self._loop
-            sim.heading_hold = self._loop
-            sim.set_command(0.4, 0.0, 0.0)
-        elif entry.scene == "fire":
-            sim.auto_reset = False
-            sim.heading_hold = False
-            sim.set_command(0.5, 0.0, 0.0)
-        else:
-            sim.auto_reset = False
-            sim.heading_hold = False
-            sim.set_command(0.5, 0.0, 0.0)
-
-    def _switch_unlocked(self, key: str, first: bool = False) -> str:
-        global _SIM
-        retiring: G1Sim | None = None
-        if self._physics_thread is not None:
-            retiring = _SIM
-            if retiring is not None:
-                retiring.stop()
-            self._physics_thread.join(timeout=5.0)
-            self._physics_thread = None
-            if retiring is not None:
-                self._retired.append(retiring)
-            time.sleep(0.15)
-
-        entry = self._by_key[key]
-        sim = self._build_sim(entry)
-        _SIM = sim
-        if first and self._initial_cmd is not None:
-            sim.set_command(*self._initial_cmd)
-            sim.auto_reset = self._loop
-            sim.heading_hold = self._loop
-        else:
-            self._apply_policy(sim, entry)
-
-        def _run():
-            sim.run(render=self._render)
-
-        self._physics_thread = threading.Thread(
-            target=_run, daemon=True, name=f"g1-physics-{key}")
-        self._physics_thread.start()
-        self._current_key = key
-        self._retired.clear()
-        return key
-
-
-# --------------------------------------------------------------------------- #
-# Module-level singleton + simple API (for the fire controller)
-# --------------------------------------------------------------------------- #
-_SIM: G1Sim | None = None
-
-
-def get_sim(scene_path=None, overlay_scene=None, spec=None) -> G1Sim:
-    global _SIM
-    if _SIM is None:
-        _SIM = G1Sim(scene_path=scene_path, overlay_scene=overlay_scene, spec=spec)
-    return _SIM
-
-
-def send_velocity_command(vx=None, vy=None, yaw=None):
-    """Set the robot's commanded body velocity. vx/vy in m/s, yaw in rad/s.
-    Any arg left None is unchanged. Returns the (clamped) active command."""
-    return get_sim().set_command(vx=vx, vy=vy, yaw=yaw)
-
-
-def get_state():
-    return get_sim().get_state()
-
-
-# --------------------------------------------------------------------------- #
-# Web viewer
-# --------------------------------------------------------------------------- #
-_PAGE = """<!doctype html><html><head><title>G1 Walk</title>
-<style>body{background:#111;color:#ddd;font-family:monospace;margin:0;text-align:center}
-img{max-width:100%;height:auto;background:#000}
-#hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px;z-index:2}
-#ego{position:fixed;bottom:10px;right:10px;border:2px solid #555;border-radius:4px;background:#000;z-index:2;display:none}
-#ego img{display:block;width:320px}
-#ego .lbl{position:absolute;top:2px;left:6px;font-size:11px;color:#0f0;text-shadow:0 0 3px #000}
-kbd{background:#333;padding:1px 5px;border-radius:3px}
-#sceneSel{margin:4px 0;font-family:monospace;background:#222;color:#ddd;border:1px solid #555}</style></head>
-<body>
-<div id="hud">
-<b>G1 locomotion</b> (12-DOF walker + kinematic arm overlay)<br>
-scene: <select id="sceneSel"></select><br>
-<kbd>W</kbd>/<kbd>S</kbd> fwd/back &nbsp; <kbd>A</kbd>/<kbd>D</kbd> turn<br>
-<kbd>Q</kbd>/<kbd>E</kbd> strafe &nbsp; <kbd>Space</kbd> stop<br>
-<kbd>H</kbd> auto-steer (re-center) <span id="hh"></span><br>
-<kbd>1</kbd> carry hose &nbsp; <kbd>2</kbd> aim &nbsp; <kbd>3</kbd> arms down &nbsp; arms: <span id="arm">?</span><br>
-<kbd>F</kbd> spray water <span id="spray">[off]</span> &nbsp; <kbd>G</kbd> reignite<br>
-fire: <span id="fire">100%</span> <span id="hit"></span><br>
-cmd: <span id="cmd">0,0,0</span><br>
-<span id="st"></span>
-</div>
-<img src="/stream"/>
-<div id="ego"><div class="lbl">ROBOT CAM</div><img id="egoImg" src="/camera"/></div>
-<script>
-let vx=0,vy=0,yaw=0,sceneBusy=false;
-function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json()).then(d=>{
-  document.getElementById('cmd').textContent=d.cmd.map(x=>x.toFixed(2)).join(', ');});}
-function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
-  document.getElementById('arm').textContent=d.arm_pose;});}
-function setEgo(on){
-  document.getElementById('ego').style.display=on?'block':'none';}
-function loadScenes(){
-  fetch('/scenes').then(r=>r.json()).then(d=>{
-    const sel=document.getElementById('sceneSel');
-    sel.innerHTML='';
-    d.scenes.forEach(s=>{
-      const o=document.createElement('option');
-      o.value=s.key; o.textContent=s.label;
-      if(s.key===d.current) o.selected=true;
-      sel.appendChild(o);});
-    setEgo(!!d.has_camera);});}
-function switchScene(key){
-  if(sceneBusy)return;
-  sceneBusy=true;
-  fetch('/scene?key='+encodeURIComponent(key)).then(r=>{
-    if(!r.ok) throw new Error('switch failed');
-    return r.json();}).then(d=>{
-    setEgo(!!d.has_camera);
-    vx=vy=yaw=0; send();}).catch(()=>{
-    loadScenes();}).finally(()=>{sceneBusy=false;});}
-document.getElementById('sceneSel').addEventListener('change',e=>{
-  switchScene(e.target.value);});
-document.addEventListener('keydown',e=>{
-  if(e.repeat)return;
-  switch(e.key.toLowerCase()){
-    case'w':vx=0.8;break; case's':vx=-0.4;break;
-    case'a':yaw=0.6;break; case'd':yaw=-0.6;break;
-    case'q':vy=0.3;break;  case'e':vy=-0.3;break;
-    case' ':vx=vy=yaw=0;break;
-    case'h':fetch('/heading?on=1').then(r=>r.json()).then(d=>{
-      document.getElementById('hh').textContent=d.heading_hold?'[ON]':'[off]';});return;
-    case'1':setArm('carry');return; case'2':setArm('aim');return;
-    case'3':setArm('down');return;
-    case'f':fetch('/spray').then(r=>r.json()).then(d=>{
-      document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';});return;
-    case'g':fetch('/reignite');return;
-    default:return;}
-  send();});
-document.addEventListener('keyup',e=>{
-  switch(e.key.toLowerCase()){
-    case'w':case's':vx=0;break;
-    case'a':case'd':yaw=0;break;
-    case'q':case'e':vy=0;break; default:return;}
-  send();});
-setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
-  if(d.arm_pose)document.getElementById('arm').textContent=d.arm_pose;
-  document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';
-  document.getElementById('fire').textContent=Math.round(d.fire_health*100)+'%';
-  document.getElementById('hit').textContent=
-    d.fire_health<=0?'\u2713 OUT':(d.spraying?(d.hitting?'\u25c9 HIT':'\u2715 MISS'):'');
-  document.getElementById('st').textContent=
-    `pos ${d.pos.map(x=>x.toFixed(2))} ${d.fell?'\u26a0 FELL':'ok'}`;});},500);
-loadScenes();
-</script></body></html>"""
-
-
-def _make_app(mgr: SimManager):
-    from flask import jsonify, request
-
-    def register(app):
-        @app.route("/cmd")
-        def cmd():
-            def f(name):
-                v = request.args.get(name)
-                return float(v) if v is not None else None
-            sim = mgr.sim()
-            c = sim.set_command(vx=f("vx"), vy=f("vy"), yaw=f("yaw"))
-            return jsonify(cmd=c.tolist())
-
-        @app.route("/heading")
-        def heading():
-            on = request.args.get("on", "1") not in ("0", "false", "")
-            mgr.sim().set_heading_hold(on)
-            return jsonify(heading_hold=on)
-
-        @app.route("/arm")
-        def arm():
-            sim = mgr.sim()
-            return jsonify(arm_pose=sim.set_overlay_arm_pose(
-                request.args.get("pose", "carry")))
-
-        @app.route("/spray")
-        def spray():
-            on = request.args.get("on")
-            return jsonify(spraying=mgr.sim().set_spray(
-                None if on is None else on not in ("0", "false", "")))
-
-        @app.route("/reignite")
-        def reignite():
-            return jsonify(fire_health=mgr.sim().reignite())
-
-        @app.route("/scenes")
-        def scenes_list():
-            return jsonify(scenes=mgr.catalog_list(), current=mgr.current_key(),
-                           has_camera=mgr.has_camera())
-
-        @app.route("/scene")
-        def scene_switch():
-            key = request.args.get("key") or request.args.get("name")
-            if not key:
-                return jsonify(error="missing key"), 400
-            try:
-                mgr.switch(key)
-            except ValueError as e:
-                return jsonify(error=str(e)), 400
-            return jsonify(current=mgr.current_key(), has_camera=mgr.has_camera())
-
-        @app.route("/camera")
-        def camera():
-            if not mgr.has_camera():
-                return "", 404
-            return mjpeg_response(mgr.cam_frames, RENDER_FPS)
-
-    def state_fn():
-        s = mgr.sim().get_state()
-        return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
-                    fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
-                    arm_pose=s["arm_pose"], spraying=bool(s["spraying"]),
-                    hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]),
-                    fires=[{"pos": list(f["pos"]), "health": float(f["health"])}
-                           for f in s["fires"]],
-                    targeted_fire=int(s["targeted_fire"]))
-
-    return create_app(page_html=_PAGE, frame_source=mgr.frames,
-                      state_fn=state_fn, register_routes=register)
-
-
-def start(block=True, serve_web=True, port=8088, render=True, initial_cmd=None,
-          scene="flat", loop=False, overlay=True, spec=None):
-    """Start the sim. With block=False, runs the loop on a background thread.
-
-    Pass a ``SceneSpec`` via ``spec`` to run a procedural scene: the XMLs are
-    (re)built from it and the robot spawns at ``spec.start``."""
-    if spec is not None:
-        initial_key = spec.name
-    else:
-        initial_key = scene if scene in SCENES else "flat"
-
-    mgr = SimManager(initial_key, overlay=overlay, render=render,
-                     loop=loop, initial_cmd=initial_cmd)
-
-    if serve_web:
-        serve(_make_app(mgr), port, label="G1 walker")
-
-    if block:
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            mgr.shutdown()
-    return mgr.sim()
-
-
-def main():
-    import argparse
-
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--scene", default="flat", help="flat | obstacles | <path.xml>")
-    p.add_argument("--spec", default=None,
-                   help="path to a SceneSpec JSON (procedural scene; spawns at start)")
-    p.add_argument("--idle", action="store_true",
-                   help="stand still until commanded (default: walk forward)")
-    p.add_argument("--vx", type=float, default=None, help="initial forward speed")
-    p.add_argument("--port", type=int, default=8088)
-    p.add_argument("--loop", dest="loop", action="store_true", default=None,
-                   help="auto-reset & replay (default: on for obstacles)")
-    p.add_argument("--no-loop", dest="loop", action="store_false")
-    p.add_argument("--no-overlay", dest="overlay", action="store_false", default=True,
-                   help="render the bare 12-DOF body (no arms)")
-    args = p.parse_args()
-
-    spec = None
-    if args.spec:
-        from ember.spec import from_json
-        spec = from_json(args.spec)
-
-    # Procedural scenes have walls; stand still by default so the blind walker
-    # doesn't march into one. Named demo scenes keep their walk-forward default.
-    default_vx = 0.0 if spec is not None else (0.4 if args.scene == "obstacles" else 0.5)
-    vx = 0.0 if args.idle else (args.vx if args.vx is not None else default_vx)
-    loop = (args.scene == "obstacles") if args.loop is None else args.loop
-    start(block=True, serve_web=True, port=args.port,
-          initial_cmd=(vx, 0.0, 0.0), scene=args.scene, loop=loop,
-          overlay=args.overlay, spec=spec)
-
-
-if __name__ == "__main__":
-    main()

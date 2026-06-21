@@ -1,26 +1,30 @@
 """Procedural SceneSpec generation and validation (Phase 1).
 
 Deterministic given ``seed``; rejects specs that violate navigation or placement
-invariants. Occupancy / reachability uses the same resolution and robot-radius
-inflation Phase 2 ``nav.Costmap`` will use.
+invariants. Occupancy / reachability uses :mod:`ember.nav` (single source of truth).
 """
 from __future__ import annotations
 
 import math
-from collections import deque
 
 import numpy as np
 
+from .nav import (
+    NAV_INFLATION,
+    NAV_RES,
+    SPRAY_STANDOFF,
+    cell_in_grid as _cell_in_grid,
+    flood_fill_reachable,
+    occupancy_grid,
+    point_in_any_wall,
+    point_in_wall,
+    world_to_cell as _world_to_cell,
+)
 from .spec import DebrisSpec, SceneSpec, TerrainSpec
-
-# Aligned with MISSION_PIPELINE_PLAN Phase 2 nav.Costmap defaults.
-NAV_RES = 0.10
-NAV_INFLATION = 0.40  # robot radius (m)
 
 ROBOT_RADIUS = NAV_INFLATION
 BOUNDS_MARGIN = 0.45          # start/home/fires must stay inside bounds by this much
 MIN_FIRE_SPACING = 1.0        # distinct fire targets (m)
-SPRAY_STANDOFF = 1.6          # matches fire_controller.in_range_m
 WALL_HEIGHT = 0.8             # tall enough that the blind walker cannot step over
 TERRAIN_MAX_ELEVATION = 0.08  # blind-policy envelope; steeper cells become obstacles
 DEBRIS_MAX_HEIGHT = 0.12      # max exposed height / tier rise (m)
@@ -31,26 +35,6 @@ DEBRIS_KINDS = ("log", "bump", "tier")
 MAX_GENERATION_ATTEMPTS = 2000
 
 _DEFAULT_BOUNDS = (-1.0, 8.0, -4.0, 4.0)
-
-
-def _rot_local(px: float, py: float, cx: float, cy: float, theta: float) -> tuple[float, float]:
-    dx, dy = px - cx, py - cy
-    c, s = math.cos(theta), math.sin(theta)
-    return c * dx + s * dy, -s * dx + c * dy
-
-
-def point_in_wall(px: float, py: float, wall: tuple[float, float, float, float, float],
-                  inflation: float = 0.0) -> bool:
-    """True if (px, py) lies inside a wall footprint expanded by ``inflation``."""
-    cx, cy, w, h, theta = wall
-    lx, ly = _rot_local(px, py, cx, cy, theta)
-    return abs(lx) <= w / 2 + inflation and abs(ly) <= h / 2 + inflation
-
-
-def point_in_any_wall(px: float, py: float,
-                      walls: tuple[tuple[float, float, float, float, float], ...],
-                      inflation: float = 0.0) -> bool:
-    return any(point_in_wall(px, py, w, inflation) for w in walls)
 
 
 def _inside_bounds(x: float, y: float, bounds: tuple[float, float, float, float],
@@ -70,55 +54,6 @@ def wall_corners(wall: tuple[float, float, float, float, float]) -> list[tuple[f
         wy = cy + s * lx + c * ly
         corners.append((wx, wy))
     return corners
-
-
-def occupancy_grid(spec: SceneSpec, res: float = NAV_RES,
-                   inflation: float = NAV_INFLATION) -> tuple[np.ndarray, float, float, float]:
-    """Return (occupied, xmin, ymin, res). ``occupied[j, i]`` is True when impassable."""
-    xmin, xmax, ymin, ymax = spec.bounds
-    nx = max(1, int(math.ceil((xmax - xmin) / res)))
-    ny = max(1, int(math.ceil((ymax - ymin) / res)))
-    grid = np.zeros((ny, nx), dtype=bool)
-    walls = spec.walls
-    for j in range(ny):
-        wy = ymin + (j + 0.5) * res
-        for i in range(nx):
-            wx = xmin + (i + 0.5) * res
-            if point_in_any_wall(wx, wy, walls, inflation):
-                grid[j, i] = True
-    return grid, xmin, ymin, res
-
-
-def _world_to_cell(x: float, y: float, xmin: float, ymin: float, res: float) -> tuple[int, int]:
-    return int((x - xmin) / res), int((y - ymin) / res)
-
-
-def _cell_in_grid(i: int, j: int, grid: np.ndarray) -> bool:
-    ny, nx = grid.shape
-    return 0 <= i < nx and 0 <= j < ny
-
-
-def flood_fill_reachable(grid: np.ndarray, start_ij: tuple[int, int]) -> np.ndarray:
-    """8-connected BFS; returns bool array same shape as ``grid`` (True = reachable)."""
-    ny, nx = grid.shape
-    reachable = np.zeros((ny, nx), dtype=bool)
-    si, sj = start_ij
-    if not _cell_in_grid(si, sj, grid) or grid[sj, si]:
-        return reachable
-    q: deque[tuple[int, int]] = deque([(si, sj)])
-    reachable[sj, si] = True
-    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    while q:
-        ci, cj = q.popleft()
-        for di, dj in neighbors:
-            ni, nj = ci + di, cj + dj
-            if not _cell_in_grid(ni, nj, grid):
-                continue
-            if grid[nj, ni] or reachable[nj, ni]:
-                continue
-            reachable[nj, ni] = True
-            q.append((ni, nj))
-    return reachable
 
 
 def _goal_reachable(reachable: np.ndarray, gx: float, gy: float,

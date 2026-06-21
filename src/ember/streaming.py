@@ -77,19 +77,16 @@ def mjpeg_response(frame_source: FrameSource, fps: float = RENDER_FPS):
 def create_app(
     *,
     page_html: str,
-    frame_buffer: FrameBuffer | None = None,
-    frame_source: FrameSource | None = None,
+    frame_source: FrameSource,
     state_fn: Callable[[], dict],
     register_routes: Callable[["Flask"], None] | None = None,
     fps: float = RENDER_FPS,
 ):
     """Build the Flask app: ``/`` (page), ``/stream`` (MJPEG), ``/state``
     (JSON). Demo-specific control endpoints (and extra feeds) are added via
-    ``register_routes``. Pass ``frame_source`` (or legacy ``frame_buffer``)
-    for the MJPEG feed."""
+    ``register_routes``. ``frame_source`` is a :class:`FrameBuffer` or a zero-arg
+    callable returning the current buffer (re-fetched each frame for hot-swaps)."""
     from flask import Flask, jsonify
-
-    src: FrameSource = frame_source if frame_source is not None else frame_buffer
 
     app = Flask(__name__)
 
@@ -99,7 +96,7 @@ def create_app(
 
     @app.route("/stream")
     def stream():
-        return mjpeg_response(src, fps)
+        return mjpeg_response(frame_source, fps)
 
     @app.route("/state")
     def state():

@@ -3,15 +3,18 @@
 Unitree G1 firefighting-humanoid demo in MuJoCo, rendered headlessly (EGL) and
 streamed to a browser.
 
-- **`ember.locomotion`** — Unitree's pretrained **12-DOF** RL walker (robust
+- **`ember.sim`** — Unitree's pretrained **12-DOF** RL walker (robust
   `(vx, vy, yaw)` velocity control + obstacle traversal) with a kinematic
-  full-body arm overlay that carries a fire-hose nozzle. Port **8088**.
+  full-body arm overlay that carries a fire-hose nozzle, plus the water-jet
+  ballistics and A*/approach navigation hooks.
+- **`ember.viewer`** — discovers the named + procedural scenes, hot-swaps them,
+  and streams the sim to a browser (driving, nav map, autonomous approach).
+  Port **8088**.
 
 ## Install
 
 ```bash
-pip install -e .            # core (walker + streaming)
-pip install -e ".[fire]"    # + OpenCV flame detection
+pip install -e .
 ```
 
 ## External assets (not vendored)
@@ -35,27 +38,19 @@ python scripts/build_scenes.py --force           # (re)generate scene XMLs
 Browser controls: **WASD** drive, **Q/E** strafe, **Space** stop, **H**
 auto-steer, **1/2/3** for carry/aim/down arm poses; plus a robot POV inset.
 
-## Programmatic control (fire-controller hook)
+## Programmatic control
+
+`viewer.start` returns the live `G1Sim`, which exposes the control API directly:
 
 ```python
-from ember import locomotion
-locomotion.start(block=False, scene="fire")        # flat ground + flame at 4 m
-locomotion.send_velocity_command(vx=0.5, yaw=0.2)  # clamped (vx, vy, yaw)
-locomotion.get_state()                             # pose, velocity, fell flag
-sim = locomotion.get_sim()
-sim.set_overlay_arm_pose("aim")                    # preset name, OR ...
-sim.set_overlay_arm_pose({"left_elbow": 0.9})      # continuous joint dict
+from ember import viewer
+sim = viewer.start(block=False, scene="fire")  # flat ground + flame at 4 m
+sim.set_command(vx=0.5, yaw=0.2)               # clamped (vx, vy, yaw)
+sim.get_state()                                # pose, velocity, fell flag, fires
+sim.set_overlay_arm_pose("aim")                # preset name, OR ...
+sim.set_overlay_arm_pose({"left_elbow": 0.9})  # continuous joint dict
 ```
 
-## Fire controller (skeleton)
-
-`ember.fire_controller` turns a camera frame into approach + aim commands:
-
-- `FlameDetector` — HSV-threshold + largest-blob centroid (needs `[fire]`).
-- `GroundPlaneProjector` — back-projects a pixel onto the ground plane.
-- `FireController` — `SEARCH → TOO_FAR → IN_RANGE → SPRAYING → EXTINGUISHED`,
-  actuating via injected `velocity_fn` / `arm_fn` (testable with fakes).
-  `FireController.from_locomotion()` binds it to the live walker.
-
-The nozzle-aiming ballistic IK is still a stub (`TODO(ballistic-ik)`); spray
-currently uses the `"aim"` preset.
+For a procedural scene, pass a `SceneSpec` (`viewer.start(spec=...)`); the robot
+spawns at `spec.start` and `sim.set_approach(True)` autonomously navigates to the
+nearest burning fire and faces it.
