@@ -259,12 +259,6 @@ kbd{font-family:var(--mono);font-size:10px;background:var(--panel2);border:1px s
             <button data-vx="-0.4">&#9660;</button>
             <button></button>
           </div>
-          <div class="ctl-label">Arm pose</div>
-          <div class="seg" id="armSeg">
-            <button data-pose="carry">Carry</button>
-            <button data-pose="aim">Aim</button>
-            <button data-pose="down">Down</button>
-          </div>
           <div class="ctl-label">Systems</div>
           <div class="row">
             <button id="sprayBtn">Spray</button>
@@ -395,8 +389,6 @@ function switchScene(key){
    .catch(loadScenes).finally(()=>{sceneBusy=false;});}
 $('sceneSel').addEventListener('change',e=>switchScene(e.target.value));
 
-function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
-  document.querySelectorAll('#armSeg button').forEach(b=>b.classList.toggle('on',b.dataset.pose===d.arm_pose));}).catch(()=>{});}
 function toggleSpray(){fetch('/spray').then(r=>r.json()).catch(()=>{});}
 function toggleHeading(){hh=!hh;fetch('/heading?on='+(hh?1:0)).then(r=>r.json())
   .then(d=>{hh=!!d.heading_hold;$('headingBtn').classList.toggle('on',hh);}).catch(()=>{});}
@@ -439,7 +431,6 @@ $('sprayBtn').addEventListener('click',toggleSpray);
 $('headingBtn').addEventListener('click',toggleHeading);
 $('windBtn').addEventListener('click',toggleWind);
 $('reigniteBtn').addEventListener('click',()=>fetch('/reignite').catch(()=>{}));
-document.querySelectorAll('#armSeg button').forEach(b=>b.addEventListener('click',()=>setArm(b.dataset.pose)));
 
 document.addEventListener('keydown',e=>{
   if(e.repeat||(e.target&&e.target.tagName==='INPUT'))return;
@@ -448,7 +439,6 @@ document.addEventListener('keydown',e=>{
     case'q':vy=0.3;break;case'e':vy=-0.3;break;
     case' ':vx=vy=yaw=0;setApproach(false);break;
     case'h':toggleHeading();return;
-    case'1':setArm('carry');return;case'2':setArm('aim');return;case'3':setArm('down');return;
     case'f':toggleSpray();return;case'g':fetch('/reignite').catch(()=>{});return;
     default:return;}
   send();});
@@ -482,7 +472,6 @@ setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
   if(ph==='ready')setPill('approachPill','good','in position');
   else if(ph)setPill('approachPill','warn',phaseLabel(ph));
   else setPill('approachPill','','manual');
-  document.querySelectorAll('#armSeg button').forEach(b=>b.classList.toggle('on',b.dataset.pose===d.arm_pose));
   $('sprayBtn').classList.toggle('on',!!d.spraying);
   windOn=!!d.wind_enabled;$('windBtn').classList.toggle('on',windOn);
   const wx=(d.wind&&d.wind[0])||0,wy=(d.wind&&d.wind[1])||0;

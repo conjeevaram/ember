@@ -7,8 +7,9 @@ vector -- see :meth:`G1Sim.set_command`.
 
 Arms: the 12-DOF model's arms are welded decoration, so for rendering we drive a
 full 29-DOF (with hands) body whose base + 12 legs are copied from the physics
-sim every frame, with the arms posed kinematically (carry hose / aim) -- an
-articulated, posable upper body on the bulletproof walker, no extra physics.
+sim every frame, with the arms held in a fixed locked hose-carry pose (see
+:mod:`ember.arms`) -- a hose-carrying upper body on the bulletproof walker, no
+extra physics.
 
 The interactive web viewer that hot-swaps and serves this sim lives in
 :mod:`ember.viewer`.
@@ -223,7 +224,6 @@ class G1Sim:
         # Rendering (model/renderer created lazily in the render thread).
         self.render_model = None
         self.render_data = None
-        self.overlay_arm_pose = "carry"  # preset name OR {joint: angle} dict
         self.spraying = False            # fire scene: water jet on/off
         self.jet_speed = 7.0             # m/s muzzle speed of the water
         self.aim_pitch = NOZZLE_REST_PITCH   # fixed nozzle elevation (no auto-aim)
@@ -304,24 +304,6 @@ class G1Sim:
         self._manual_yaw = not on
         return on
 
-    def set_overlay_arm_pose(self, pose):
-        """Pose the overlay arms.
-
-        ``pose`` is either a preset name -- ``'carry'`` (hold hose), ``'aim'``,
-        ``'down'`` -- or a dict of ``{joint_name: angle_rad}`` for continuous
-        control. Joint names may omit the ``_joint`` suffix; unspecified arm
-        joints go to 0. Invalid input is ignored (the previous pose is kept).
-        Returns the active pose."""
-        if isinstance(pose, str):
-            if pose in arms.ARM_POSES:
-                self.overlay_arm_pose = pose
-        elif isinstance(pose, dict):
-            try:
-                self.overlay_arm_pose = {str(k): float(v) for k, v in pose.items()}
-            except (TypeError, ValueError):
-                pass
-        return self.overlay_arm_pose
-
     def set_spray(self, on=None):
         """Toggle (or set) the water jet (fire scene only). Returns the state.
 
@@ -385,14 +367,8 @@ class G1Sim:
         self.fire_health = [1.0] * len(self.fire_positions)
         return self.fire_health[self.targeted_fire]
 
-    @property
-    def arm_pose_label(self) -> str:
-        """Short label for the active pose (preset name, or 'custom')."""
-        return (self.overlay_arm_pose if isinstance(self.overlay_arm_pose, str)
-                else "custom")
-
     def get_state(self):
-        """Pelvis pose/vel (world frame) + command + fallen flag + arm pose."""
+        """Pelvis pose/vel (world frame) + command + fallen flag."""
         return {
             "pos": self.data.qpos[0:3].copy(),
             "quat": self.data.qpos[3:7].copy(),
@@ -401,7 +377,6 @@ class G1Sim:
             "cmd": self.cmd.copy(),
             "fell": self._fell,
             "sim_time": self.data.time,
-            "arm_pose": self.arm_pose_label if self.overlay_scene else None,
             "spraying": self.spraying,
             "hitting": self._hitting,
             "fires": [{"pos": p, "health": h}
@@ -772,10 +747,11 @@ class G1Sim:
             if self.render_model is None:
                 self._init_render_model()
             rd = self.render_data
-            # Drive the overlay body from physics: base + legs copied, arms posed.
+            # Drive the overlay body from physics: base + legs copied, arms held
+            # in the fixed locked carry pose.
             rd.qpos[0:7] = self.data.qpos[0:7]
             rd.qpos[self._render_leg_qadr] = self.data.qpos[self.leg_qadr]
-            targets = arms.resolve_pose(self.overlay_arm_pose, self._render_aux_names)
+            targets = arms.locked_pose(self._render_aux_names)
             for name, adr in zip(self._render_aux_names, self._render_aux_qadr):
                 rd.qpos[adr] = targets[name]
             if self._nozzle_qadr >= 0:

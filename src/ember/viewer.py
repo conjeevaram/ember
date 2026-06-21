@@ -242,11 +242,6 @@ def _make_app(mgr: SimManager):
             mgr.sim().set_heading_hold(on)
             return jsonify(heading_hold=on)
 
-        @app.route("/arm")
-        def arm():
-            return jsonify(arm_pose=mgr.sim().set_overlay_arm_pose(
-                request.args.get("pose", "carry")))
-
         @app.route("/spray")
         def spray():
             on = request.args.get("on")
@@ -336,7 +331,7 @@ def _make_app(mgr: SimManager):
                     lin_vel=s["lin_vel"].tolist(), wind=s.get("wind", [0.0, 0.0]),
                     wind_enabled=bool(mgr.sim().wind_enabled),
                     fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
-                    arm_pose=s["arm_pose"], spraying=bool(s["spraying"]),
+                    spraying=bool(s["spraying"]),
                     hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]),
                     fires=[{"pos": list(f["pos"]), "health": float(f["health"])}
                            for f in s["fires"]],

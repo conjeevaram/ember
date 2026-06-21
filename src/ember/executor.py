@@ -204,9 +204,17 @@ class MissionExecutor:
         self.sim.set_targeted_fire(target)
         if not self._approach_and_ready():
             self._set_message(f"visit approach failed for fire {target}")
+        # The target fire is still alive after a visit, so the sim's approach
+        # state (_approach_enabled/_approach_ready) is never auto-cleared the way
+        # it is after an extinguish. Release it explicitly: otherwise the stale
+        # blocked-replan handler cancels the next navigator (e.g. return-home)
+        # when the robot pivots in place, wedging it at the fire.
+        self.sim.set_approach(False)
+        self.sim.set_command(0.0, 0.0, 0.0)
         return True
 
     def _search(self) -> bool:
+        self.sim.set_approach(False)
         self._search_seen = set()
         cm = Costmap.from_spec(self.sim.spec)
         waypoints = _coverage_waypoints(cm)
@@ -259,6 +267,7 @@ class MissionExecutor:
         return not self._paused
 
     def _return_home(self) -> bool:
+        self.sim.set_approach(False)
         cm = Costmap.from_spec(self.sim.spec)
         st = self.sim.get_state()
         x, y = float(st["pos"][0]), float(st["pos"][1])

@@ -177,19 +177,25 @@ def _nearest_fires_to_home(spec: SceneSpec, n: int) -> list[int]:
     return order[: max(0, n)]
 
 
+_RETURN_RE = re.compile(r"\b(return|returning|go back|going back|come back|"
+                        r"coming back|head back|head home|go home|back home|home)\b")
+
+
 def _parse_segment(segment: str, spec: SceneSpec) -> list[dict[str, object]]:
-    """Map one prompt clause to raw task dicts (before validation)."""
+    """Map one prompt clause to raw task dicts (before validation).
+
+    A clause may carry BOTH an action and a trailing "return" (e.g. "put out two
+    fires and return home" — joined by 'and', not 'then'); we emit the action(s)
+    first, then the return, so the homeward leg never swallows the real task.
+    """
     seg = segment.strip()
     if not seg:
         return []
 
     raw: list[dict[str, object]] = []
+    wants_return = bool(_RETURN_RE.search(seg))
 
-    if re.search(r"\b(return|go back|come back|home)\b", seg):
-        raw.append({"type": "return", "target": None})
-        return raw
-
-    if re.search(r"\b(search|find|look|scan|explore|patrol|map)\b", seg):
+    if re.search(r"\b(search|find|look|scan|explore|patrol|map|sweep)\b", seg):
         raw.append({"type": "search", "target": None})
 
     nums = _fire_numbers(seg)
@@ -220,6 +226,9 @@ def _parse_segment(segment: str, spec: SceneSpec) -> list[dict[str, object]]:
                     raw.append({"type": "extinguish", "target": idx})
             else:
                 raw.append({"type": "extinguish", "target": None})
+
+    if wants_return:
+        raw.append({"type": "return", "target": None})
 
     return raw
 

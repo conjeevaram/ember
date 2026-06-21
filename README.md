@@ -36,7 +36,7 @@ python scripts/build_scenes.py --force           # (re)generate scene XMLs
 ```
 
 Browser controls: **WASD** drive, **Q/E** strafe, **Space** stop, **H**
-auto-steer, **1/2/3** for carry/aim/down arm poses; plus a robot POV inset.
+auto-steer; plus a robot POV inset. The arms are locked in a hose-carry pose.
 
 ## Programmatic control
 
@@ -47,8 +47,6 @@ from ember import viewer
 sim = viewer.start(block=False, scene="fire")  # flat ground + flame at 4 m
 sim.set_command(vx=0.5, yaw=0.2)               # clamped (vx, vy, yaw)
 sim.get_state()                                # pose, velocity, fell flag, fires
-sim.set_overlay_arm_pose("aim")                # preset name, OR ...
-sim.set_overlay_arm_pose({"left_elbow": 0.9})  # continuous joint dict
 ```
 
 For a procedural scene, pass a `SceneSpec` (`viewer.start(spec=...)`); the robot
