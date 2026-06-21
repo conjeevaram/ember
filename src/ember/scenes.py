@@ -1,5 +1,5 @@
-"""Generate the MuJoCo demo scenes (flat + obstacle course) for both the 12-DOF
-physics body and the 29-DOF render-overlay body.
+"""Generate the MuJoCo demo scenes (flat / obstacle course / fire) for both the
+12-DOF physics body and the 29-DOF render-overlay body.
 
 Scenes must sit next to the robot model so the model's relative ``meshdir``
 resolves, so they are written into ``$UNITREE_RL_GYM/.../g1_description``. The
@@ -22,6 +22,13 @@ FLAT_12 = "g1_flat_demo.xml"
 OBSTACLES_12 = "g1_obstacles_demo.xml"
 FLAT_29 = "g1_flat29_demo.xml"
 OBSTACLES_29 = "g1_obstacles29_demo.xml"
+FIRE_12 = "g1_fire_demo.xml"
+FIRE_29 = "g1_fire29_demo.xml"
+
+# Fire prop: ground point (x, y, z) where the flame base sits, straight ahead of
+# the spawn. Fixed and known so the controller can be validated against ground
+# truth before the perception path is trusted. Query as scenes.FIRE_POSITION_WORLD.
+FIRE_POSITION_WORLD = (4.0, 0.0, 0.0)
 
 # 12-DOF physics body and the full 29-DOF (with hands) overlay body.
 MODEL_12 = "g1_12dof.xml"
@@ -77,6 +84,20 @@ def obstacle_geoms(bump_x=1.2, bump_radius=0.30, bump_expose=0.07,
     return "\n    ".join(g)
 
 
+def fire_geom(pos=FIRE_POSITION_WORLD) -> str:
+    """A bright flame prop: orange body + yellow tip. Non-colliding (contype=0)
+    so the robot can walk up to it; it's a visual target for the detector."""
+    x, y, z = pos
+    return "\n    ".join([
+        f'<geom name="fire_base" type="cylinder" size="0.18 0.30" '
+        f'pos="{x} {y} {z + 0.30}" rgba="0.95 0.35 0.05 1" '
+        f'contype="0" conaffinity="0"/>',
+        f'<geom name="fire_tip" type="ellipsoid" size="0.15 0.15 0.28" '
+        f'pos="{x} {y} {z + 0.72}" rgba="1.0 0.80 0.10 1" '
+        f'contype="0" conaffinity="0"/>',
+    ])
+
+
 def _scene_12(model_label: str, statistic: str, body_extra: str = "") -> str:
     """A 12-DOF scene: the model has no floor/sky, so we add them here."""
     return f"""<mujoco model="{model_label}">
@@ -105,7 +126,7 @@ def _scene_29(model_label: str, statistic: str, body_extra: str = "") -> str:
 
 
 def render_scene(name: str) -> str:
-    """Return the XML text for one of the four named scenes."""
+    """Return the XML text for one of the named scenes."""
     if name == FLAT_12:
         return _scene_12("g1 flat scene", '<statistic center="0 0 0.8" extent="1.2"/>')
     if name == OBSTACLES_12:
@@ -116,6 +137,12 @@ def render_scene(name: str) -> str:
     if name == OBSTACLES_29:
         return _scene_29("g1 obstacles 29dof render", '<statistic center="2 0 0.8" extent="3"/>',
                          obstacle_geoms())
+    if name == FIRE_12:
+        return _scene_12("g1 fire scene", '<statistic center="2 0 0.8" extent="3"/>',
+                         fire_geom())
+    if name == FIRE_29:
+        return _scene_29("g1 fire 29dof render", '<statistic center="2 0 0.8" extent="3"/>',
+                         fire_geom())
     raise ValueError(f"unknown scene: {name}")
 
 
@@ -128,7 +155,7 @@ def write_scene(name: str) -> str:
 def ensure_scenes(force: bool = False) -> list[str]:
     """Generate all demo scenes into the model dir. Returns the paths written."""
     written = []
-    for name in (FLAT_12, OBSTACLES_12, FLAT_29, OBSTACLES_29):
+    for name in (FLAT_12, OBSTACLES_12, FLAT_29, OBSTACLES_29, FIRE_12, FIRE_29):
         path = G1_MODEL_DIR / name
         if force or not path.exists():
             written.append(write_scene(name))
@@ -145,7 +172,7 @@ def main() -> None:
     if not G1_MODEL_DIR.exists():
         raise SystemExit(f"model dir not found: {G1_MODEL_DIR}\n"
                          "Set $UNITREE_RL_GYM to your unitree_rl_gym checkout.")
-    written = ensure_scenes(force=True if args.force else False)
+    written = ensure_scenes(force=args.force)
     if written:
         print("wrote:\n  " + "\n  ".join(written))
     else:

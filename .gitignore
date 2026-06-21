@@ -16,9 +16,8 @@ MUJOCO_LOG.TXT
 *.log
 mujoco_videos/
 
-# Training outputs (live on the 5090, not in the repo)
-train_5090/.venv/
-train_5090/checkpoints/
+# Training setup + outputs (live on the 5090, not in the repo)
+train_5090/
 *.mp4
 *.npz
 *.pkl
@@ -30,3 +29,7 @@ train_5090/checkpoints/
 
 # Local agent/session transcripts (kept out of version control)
 claude_chat.txt
+
+# Scratch reference screenshots (pose references, not source)
+image.png
+image copy.png

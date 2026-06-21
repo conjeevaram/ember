@@ -24,6 +24,7 @@ Programmatic (for the fire controller):
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -33,19 +34,94 @@ import torch
 import yaml
 
 from . import arms, scenes
-from .config import (DEPLOY_CONFIG_PATH, G1_MODEL_DIR, POLICY_PATH, RENDER_FPS,
-                     RENDER_H, RENDER_W, VX_RANGE, VY_RANGE, YAW_RANGE, clamp,
-                     gravity_orientation, quat_yaw)
-from .streaming import FrameBuffer, create_app, encode_jpeg, serve
+from .config import (CAM_FOVY, CAM_H, CAM_W, DEPLOY_CONFIG_PATH, G1_MODEL_DIR,
+                     POLICY_PATH, RENDER_FPS, RENDER_H, RENDER_W, VX_RANGE,
+                     VY_RANGE, YAW_RANGE, clamp, gravity_orientation, quat_yaw)
+from .streaming import FrameBuffer, create_app, encode_jpeg, mjpeg_response, serve
+
+# Ego ("helmet") camera mount, in the torso_link frame: a bit forward and up to
+# head height, looking forward and tilted down to see the ground ahead.
+EGO_CAM_POS = (0.10, 0.0, 0.45)
+EGO_CAM_TILT_DEG = 18.0
+
+
+def _ego_camera_quat(tilt_deg: float) -> list[float]:
+    """Quaternion orienting a torso-mounted camera to look forward (+x body)
+    and ``tilt_deg`` downward. MuJoCo cameras look down their local -Z."""
+    t = math.radians(tilt_deg)
+    # Columns are the camera axes (x-right, y-up, -z-forward) in the body frame.
+    R = np.array([[0.0, math.sin(t), -math.cos(t)],
+                  [-1.0, 0.0, 0.0],
+                  [0.0, math.cos(t), math.sin(t)]], dtype=float)
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, R.flatten())
+    return q.tolist()
+
+
+# Fire-hose fog nozzle prop. Welded to torso_link so it tracks the body as the
+# robot walks/turns -- the hands (also children of torso via the arms) hold it
+# in the "carry" pose. Offset/orientation tuned by rendering against that pose:
+# the barrel runs forward (+x) through both hands at chest height, head out
+# front, maroon supply hose trailing down behind (firefighter brace stance).
+HOSE_TORSO_OFFSET = (0.439, 0.101, 0.037)
+
+
+def _y_quat(phi: float) -> list[float]:
+    """Quaternion for a rotation of ``phi`` rad about +Y (tilts +Z toward +X)."""
+    return [math.cos(phi / 2), 0.0, math.sin(phi / 2), 0.0]
+
+
+def _attach_hose(spec) -> None:
+    """Add the fog-nozzle prop as a non-colliding body under ``torso_link``."""
+    GT = mujoco.mjtGeom
+    body = spec.body("torso_link").add_body()
+    body.name = "hose"
+    body.pos = list(HOSE_TORSO_OFFSET)
+    barrel = 1.65  # barrel axis: forward (+x) with a slight downward aim
+    bq = _y_quat(barrel)
+    d = (math.sin(barrel), 0.0, math.cos(barrel))
+
+    def fx(s):  # point a distance s along the barrel axis from the grip centre
+        return [d[0] * s, d[1] * s, d[2] * s]
+
+    # name, type, size, pos, quat, rgba
+    parts = [
+        ("hose_barrel", GT.mjGEOM_CYLINDER, [0.026, 0.12, 0], [0, 0, 0], bq,
+         [0.15, 0.15, 0.17, 1]),
+        ("hose_head", GT.mjGEOM_CYLINDER, [0.045, 0.035, 0], fx(0.15), bq,
+         [0.10, 0.10, 0.12, 1]),
+        ("hose_face", GT.mjGEOM_CYLINDER, [0.042, 0.006, 0], fx(0.188), bq,
+         [0.85, 0.68, 0.12, 1]),
+        ("hose_coupling", GT.mjGEOM_CYLINDER, [0.030, 0.020, 0], fx(-0.13), bq,
+         [0.72, 0.55, 0.20, 1]),
+        ("hose_bale", GT.mjGEOM_CYLINDER, [0.011, 0.05, 0],
+         [d[0] * -0.05, 0, d[2] * -0.05 + 0.055], _y_quat(-0.40),
+         [0.12, 0.12, 0.14, 1]),
+        ("hose_tail", GT.mjGEOM_CYLINDER, [0.024, 0.16, 0], [-0.14, 0, -0.16],
+         _y_quat(3.54), [0.52, 0.16, 0.12, 1]),
+    ]
+    for name, typ, size, pos, quat, rgba in parts:
+        g = body.add_geom()
+        g.name = name
+        g.type = typ
+        g.size = size
+        g.pos = pos
+        if quat is not None:
+            g.quat = quat
+        g.rgba = rgba
+        g.contype = 0
+        g.conaffinity = 0
 
 # 12-DOF physics scenes, and their matching 29-DOF render-overlay scenes.
 SCENES = {
     "flat": str(G1_MODEL_DIR / scenes.FLAT_12),
     "obstacles": str(G1_MODEL_DIR / scenes.OBSTACLES_12),
+    "fire": str(G1_MODEL_DIR / scenes.FIRE_12),
 }
 OVERLAY_SCENES = {
     SCENES["flat"]: str(G1_MODEL_DIR / scenes.FLAT_29),
     SCENES["obstacles"]: str(G1_MODEL_DIR / scenes.OBSTACLES_29),
+    SCENES["fire"]: str(G1_MODEL_DIR / scenes.FIRE_29),
 }
 
 # The 12 leg joints, in the order the policy/config expect. The policy is
@@ -123,14 +199,22 @@ class G1Sim:
         self.render_model = None
         self.render_data = None
         self._render_maps_built = False
-        self.overlay_arm_pose_name = "carry"
+        self.overlay_arm_pose = "carry"  # preset name OR {joint: angle} dict
         self.renderer = None
         self.cam = mujoco.MjvCamera()
         self.cam.distance = 3.0
         self.cam.elevation = -15.0
         self.cam.azimuth = 135.0
 
+        # Robot-mounted ego camera (overlay only): separate renderer + frame
+        # buffer + cached world pose (for later ground-plane projection).
+        self.cam_renderer = None
+        self.ego_cam_id = -1
+        self._last_cam_rgb = None
+        self._ego_pose = None  # (pos[3], rot[3x3] world<-cam) or None
+
         self.frames = FrameBuffer()
+        self.cam_frames = FrameBuffer()
         self._cmd_lock = threading.Lock()
         self._running = False
 
@@ -153,11 +237,29 @@ class G1Sim:
         self._manual_yaw = not on
         return on
 
-    def set_overlay_arm_pose(self, name):
-        """Pose the overlay arms: 'carry' (hold hose), 'aim', or 'down'."""
-        if name in arms.ARM_POSES:
-            self.overlay_arm_pose_name = name
-        return self.overlay_arm_pose_name
+    def set_overlay_arm_pose(self, pose):
+        """Pose the overlay arms.
+
+        ``pose`` is either a preset name -- ``'carry'`` (hold hose), ``'aim'``,
+        ``'down'`` -- or a dict of ``{joint_name: angle_rad}`` for continuous
+        control (the fire controller's actuator handle). Joint names may omit
+        the ``_joint`` suffix; unspecified arm joints go to 0. Invalid input is
+        ignored (the previous pose is kept). Returns the active pose."""
+        if isinstance(pose, str):
+            if pose in arms.ARM_POSES:
+                self.overlay_arm_pose = pose
+        elif isinstance(pose, dict):
+            try:
+                self.overlay_arm_pose = {str(k): float(v) for k, v in pose.items()}
+            except (TypeError, ValueError):
+                pass
+        return self.overlay_arm_pose
+
+    @property
+    def arm_pose_label(self) -> str:
+        """Short label for the active pose (preset name, or 'custom')."""
+        return (self.overlay_arm_pose if isinstance(self.overlay_arm_pose, str)
+                else "custom")
 
     def get_state(self):
         """Pelvis pose/vel (world frame) + command + fallen flag + arm pose."""
@@ -169,8 +271,28 @@ class G1Sim:
             "cmd": self.cmd.copy(),
             "fell": self._fell,
             "sim_time": self.data.time,
-            "arm_pose": self.overlay_arm_pose_name if self.overlay_scene else None,
+            "arm_pose": self.arm_pose_label if self.overlay_scene else None,
         }
+
+    # -- robot ego camera ---------------------------------------------------- #
+    @property
+    def has_camera(self) -> bool:
+        return bool(self.overlay_scene)
+
+    def get_camera_frame(self, encode: bool = False):
+        """Latest robot-POV frame. ``encode=False`` -> RGB ndarray (feed the
+        flame detector); ``encode=True`` -> JPEG bytes (for streaming). Returns
+        None until the first ego frame has rendered."""
+        return self.cam_frames.get() if encode else self._last_cam_rgb
+
+    def get_camera_pose(self):
+        """Ego camera world pose as ``(pos[3], rot[3x3])`` or None. ``rot``
+        columns are the camera axes in world (MuJoCo cam looks along -Z)."""
+        return self._ego_pose
+
+    def get_camera_intrinsics(self):
+        """(fovy_deg, width, height) of the ego camera."""
+        return (CAM_FOVY, CAM_W, CAM_H)
 
     # -- joint maps & policy ------------------------------------------------- #
     def _build_leg_maps(self):
@@ -192,6 +314,12 @@ class G1Sim:
         grav = gravity_orientation(quat)
         omega = omega * self.ang_vel_scale
 
+        # NOTE: this blind policy balances *by* stepping -- at zero command it
+        # marks time in place (~3-4 cm foot lift). Freezing or damping the gait
+        # to plant the feet makes it drift or fall (verified), so we keep the
+        # gait clock advancing. A true planted stand needs the trained
+        # stand-capable policy (see train_5090/). Idle station-keeping is
+        # available via heading_hold to stop any positional wander.
         period = 0.8
         t = self.counter * self.sim_dt
         phase = (t % period) / period
@@ -234,22 +362,46 @@ class G1Sim:
         self._render_aux_qadr = np.array(qadr, dtype=int)
         self._render_maps_built = True
 
+    def _init_render_model(self):
+        """Build the 29-DOF overlay model with a torso-mounted ego camera, and
+        create both the third-person and ego renderers. Runs in the render
+        thread (owns the GL context)."""
+        spec = mujoco.MjSpec.from_file(self.overlay_scene)
+        try:
+            cam = spec.body("torso_link").add_camera()
+            cam.name = "ego"
+            cam.pos = list(EGO_CAM_POS)
+            cam.fovy = CAM_FOVY
+            cam.quat = _ego_camera_quat(EGO_CAM_TILT_DEG)
+        except Exception as e:  # overlay still works without the ego cam
+            print("ego camera attach failed:", e)
+        try:
+            _attach_hose(spec)
+        except Exception as e:  # overlay still works without the hose prop
+            print("hose attach failed:", e)
+        self.render_model = spec.compile()
+        # One offscreen buffer must hold the larger of the two render sizes.
+        self.render_model.vis.global_.offwidth = max(RENDER_W, CAM_W)
+        self.render_model.vis.global_.offheight = max(RENDER_H, CAM_H)
+        self.render_data = mujoco.MjData(self.render_model)
+        self._build_render_maps()
+        self.renderer = mujoco.Renderer(self.render_model, RENDER_H, RENDER_W)
+        self.ego_cam_id = mujoco.mj_name2id(
+            self.render_model, mujoco.mjtObj.mjOBJ_CAMERA, "ego")
+        if self.ego_cam_id >= 0:
+            self.cam_renderer = mujoco.Renderer(self.render_model, CAM_H, CAM_W)
+
     def render_once(self):
         """Render the current frame to the shared frame buffer. Must run on the
         thread that owns the GL context (see :meth:`run`)."""
         if self.overlay_scene:
             if self.render_model is None:
-                self.render_model = mujoco.MjModel.from_xml_path(self.overlay_scene)
-                self.render_model.vis.global_.offwidth = RENDER_W
-                self.render_model.vis.global_.offheight = RENDER_H
-                self.render_data = mujoco.MjData(self.render_model)
-                self._build_render_maps()
-                self.renderer = mujoco.Renderer(self.render_model, RENDER_H, RENDER_W)
+                self._init_render_model()
             rd = self.render_data
             # Drive the overlay body from physics: base + legs copied, arms posed.
             rd.qpos[0:7] = self.data.qpos[0:7]
             rd.qpos[self._render_leg_qadr] = self.data.qpos[self.leg_qadr]
-            targets = arms.resolve_pose(self.overlay_arm_pose_name, self._render_aux_names)
+            targets = arms.resolve_pose(self.overlay_arm_pose, self._render_aux_names)
             for name, adr in zip(self._render_aux_names, self._render_aux_qadr):
                 rd.qpos[adr] = targets[name]
             mujoco.mj_forward(self.render_model, rd)
@@ -262,12 +414,26 @@ class G1Sim:
             self.renderer.update_scene(self.data, self.cam)
         self.frames.set(encode_jpeg(self.renderer.render()))
 
+    def render_camera_once(self):
+        """Render the robot's ego view (overlay only). Call after
+        :meth:`render_once` so the overlay kinematics are already forwarded."""
+        if self.cam_renderer is None or self.ego_cam_id < 0:
+            return
+        self.cam_renderer.update_scene(self.render_data, camera=self.ego_cam_id)
+        rgb = self.cam_renderer.render()
+        self._last_cam_rgb = rgb
+        self.cam_frames.set(encode_jpeg(rgb))
+        cid = self.ego_cam_id
+        self._ego_pose = (self.render_data.cam_xpos[cid].copy(),
+                          self.render_data.cam_xmat[cid].reshape(3, 3).copy())
+
     def _render_loop(self):
         interval = 1.0 / RENDER_FPS
         while self._running:
             t0 = time.time()
             try:
                 self.render_once()
+                self.render_camera_once()
             except Exception as e:  # a render hiccup must not kill the demo
                 print("render error:", e)
             sleep = interval - (time.time() - t0)
@@ -361,7 +527,10 @@ def get_state():
 _PAGE = """<!doctype html><html><head><title>G1 Walk</title>
 <style>body{background:#111;color:#ddd;font-family:monospace;margin:0;text-align:center}
 img{max-width:100%;height:auto;background:#000}
-#hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px}
+#hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px;z-index:2}
+#ego{position:fixed;bottom:10px;right:10px;border:2px solid #555;border-radius:4px;background:#000;z-index:2}
+#ego img{display:block;width:320px}
+#ego .lbl{position:absolute;top:2px;left:6px;font-size:11px;color:#0f0;text-shadow:0 0 3px #000}
 kbd{background:#333;padding:1px 5px;border-radius:3px}</style></head>
 <body>
 <div id="hud">
@@ -374,6 +543,7 @@ cmd: <span id="cmd">0,0,0</span><br>
 <span id="st"></span>
 </div>
 <img src="/stream"/>
+__EGO__
 <script>
 let vx=0,vy=0,yaw=0;
 function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json()).then(d=>{
@@ -429,13 +599,21 @@ def _make_app(sim: G1Sim):
             return jsonify(arm_pose=sim.set_overlay_arm_pose(
                 request.args.get("pose", "carry")))
 
+        if sim.has_camera:
+            @app.route("/camera")
+            def camera():
+                return mjpeg_response(sim.cam_frames, RENDER_FPS)
+
     def state_fn():
         s = sim.get_state()
         return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
                     fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
                     arm_pose=s["arm_pose"])
 
-    return create_app(page_html=_PAGE, frame_buffer=sim.frames,
+    ego = ('<div id="ego"><div class="lbl">ROBOT CAM</div>'
+           '<img src="/camera"/></div>') if sim.has_camera else ""
+    page = _PAGE.replace("__EGO__", ego)
+    return create_app(page_html=page, frame_buffer=sim.frames,
                       state_fn=state_fn, register_routes=register)
 
 

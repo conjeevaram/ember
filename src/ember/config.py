@@ -6,7 +6,6 @@ Environment variables
 ---------------------
 External repos (cloned separately; see README):
     UNITREE_RL_GYM   path to unitree_rl_gym   (default: ~/unitree_rl_gym)
-    GMT_ROOT         path to the GMT repo      (default: ~/GMT)
 
 Video stream (applies to both demos):
     EMBER_W, EMBER_H     frame size           (default: 640x360)
@@ -14,6 +13,10 @@ Video stream (applies to both demos):
     EMBER_QUALITY        JPEG quality 1-95     (default: 55)
     EMBER_HOST           advertised host shown in the startup URL (default:
                          auto-detected primary IP)
+
+Robot ego camera (walker overlay POV):
+    EMBER_CAM_W, EMBER_CAM_H   frame size      (default: 384x288)
+    EMBER_CAM_FOVY             vertical FOV deg (default: 70)
 """
 from __future__ import annotations
 
@@ -31,7 +34,6 @@ def _path_env(name: str, default: Path) -> Path:
 # --- external repositories (not vendored; cloned separately) --------------- #
 HOME = Path.home()
 UNITREE_RL_GYM = _path_env("UNITREE_RL_GYM", HOME / "unitree_rl_gym")
-GMT_ROOT = _path_env("GMT_ROOT", HOME / "GMT")
 
 # Unitree 12-DOF RL walker assets.
 G1_MODEL_DIR = UNITREE_RL_GYM / "resources" / "robots" / "g1_description"
@@ -44,6 +46,12 @@ RENDER_W = int(os.environ.get("EMBER_W", 640))
 RENDER_H = int(os.environ.get("EMBER_H", 360))
 RENDER_FPS = float(os.environ.get("EMBER_FPS", 18))
 JPEG_QUALITY = int(os.environ.get("EMBER_QUALITY", 55))
+
+# Robot-mounted (ego / "helmet cam") view: a forward-looking camera on the
+# overlay body's torso. Used for the live POV feed and (later) fire perception.
+CAM_W = int(os.environ.get("EMBER_CAM_W", 384))
+CAM_H = int(os.environ.get("EMBER_CAM_H", 288))
+CAM_FOVY = float(os.environ.get("EMBER_CAM_FOVY", 70))
 
 # --- velocity command clamps (m/s, m/s, rad/s) ----------------------------- #
 VX_RANGE = (-0.6, 1.0)

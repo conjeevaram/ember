@@ -18,12 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Whole-body motion-tracking demo (GMT). Its weights/assets live in $GMT_ROOT.
-gmt = ["tqdm>=4.66"]
+# Fire perception (HSV flame detection). Headless build: no GUI/libGL deps.
+fire = ["opencv-python-headless>=4.8"]
 
 [project.scripts]
 ember-walk = "ember.locomotion:main"
-ember-gmt = "ember.gmt:main"
 ember-build-scenes = "ember.scenes:main"
 
 [tool.setuptools.packages.find]

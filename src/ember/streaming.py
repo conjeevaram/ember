@@ -39,6 +39,27 @@ class FrameBuffer:
             return self._jpeg
 
 
+def mjpeg_response(frame_buffer: FrameBuffer, fps: float = RENDER_FPS):
+    """A Flask streaming Response that serves a FrameBuffer as MJPEG."""
+    from flask import Response
+
+    def gen():
+        boundary = b"--frame"
+        interval = 1.0 / fps
+        while True:
+            jpeg = frame_buffer.get()
+            if jpeg is None:
+                time.sleep(0.03)
+                continue
+            yield (boundary + b"\r\nContent-Type: image/jpeg\r\n"
+                   b"Content-Length: " + str(len(jpeg)).encode() +
+                   b"\r\n\r\n" + jpeg + b"\r\n")
+            time.sleep(interval)
+
+    return Response(gen(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
 def create_app(
     *,
     page_html: str,
@@ -48,9 +69,10 @@ def create_app(
     fps: float = RENDER_FPS,
 ):
     """Build the Flask app: ``/`` (page), ``/stream`` (MJPEG), ``/state``
-    (JSON). Demo-specific control endpoints are added via ``register_routes``.
+    (JSON). Demo-specific control endpoints (and extra feeds) are added via
+    ``register_routes``.
     """
-    from flask import Flask, Response, jsonify
+    from flask import Flask, jsonify
 
     app = Flask(__name__)
 
@@ -60,21 +82,7 @@ def create_app(
 
     @app.route("/stream")
     def stream():
-        def gen():
-            boundary = b"--frame"
-            interval = 1.0 / fps
-            while True:
-                jpeg = frame_buffer.get()
-                if jpeg is None:
-                    time.sleep(0.03)
-                    continue
-                yield (boundary + b"\r\nContent-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(jpeg)).encode() +
-                       b"\r\n\r\n" + jpeg + b"\r\n")
-                time.sleep(interval)
-
-        return Response(gen(),
-                        mimetype="multipart/x-mixed-replace; boundary=frame")
+        return mjpeg_response(frame_buffer, fps)
 
     @app.route("/state")
     def state():

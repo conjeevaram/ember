@@ -1,11 +1,8 @@
 """Ember: Unitree G1 firefighting-humanoid demos in MuJoCo.
 
-Two locomotion stacks, both rendered headlessly (EGL) and streamed to a browser:
-
-- ``ember.locomotion`` -- Unitree's pretrained 12-DOF RL walker (robust velocity
-  control + obstacle traversal) with a kinematic full-body arm overlay.
-- ``ember.gmt`` -- the GMT whole-body motion-tracking policy (physically
-  articulated arms), steered with velocity commands.
+``ember.locomotion`` runs Unitree's pretrained 12-DOF RL walker (robust velocity
+control + obstacle traversal) with a kinematic full-body arm overlay that
+carries a fire-hose nozzle, rendered headlessly (EGL) and streamed to a browser.
 
 Importing this package selects the headless GL backend before MuJoCo loads one.
 """
