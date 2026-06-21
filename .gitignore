@@ -22,6 +22,9 @@ train_5090/
 *.npz
 *.pkl
 
+# Generated procedural scenes (reproducible via scripts/build_scenes.py --random)
+scenes/
+
 # Editor / OS
 .DS_Store
 .idea/
@@ -29,6 +32,7 @@ train_5090/
 
 # Local agent/session transcripts (kept out of version control)
 claude_chat.txt
+MISSION_PIPELINE_PLAN.md
 
 # Scratch reference screenshots (pose references, not source)
 image.png

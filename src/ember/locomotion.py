@@ -25,6 +25,9 @@ from __future__ import annotations
 import math
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
 import mujoco
 import numpy as np
@@ -154,9 +157,11 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
 class G1Sim:
     """12-DOF locomotion sim + kinematic full-body render overlay."""
 
-    def __init__(self, scene_path: str | None = None, overlay_scene: str | None = None):
+    def __init__(self, scene_path: str | None = None, overlay_scene: str | None = None,
+                 spec=None):
         self.scene_path = scene_path or SCENES["flat"]
         self.overlay_scene = overlay_scene
+        self.spec = spec
 
         with open(DEPLOY_CONFIG_PATH) as f:
             cfg = yaml.safe_load(f)
@@ -189,12 +194,19 @@ class G1Sim:
 
         self._spawn_qpos = self.data.qpos.copy()
         self._spawn_qpos[self.leg_qadr] = self.default_angles
+        if spec is not None:
+            # Spawn the base at the SceneSpec start (x, y, yaw); keep the model's
+            # default standing height in z. Quaternion is [w, x, y, z].
+            sx, sy, syaw = spec.start
+            self._spawn_qpos[0] = sx
+            self._spawn_qpos[1] = sy
+            self._spawn_qpos[3:7] = [np.cos(syaw / 2), 0.0, 0.0, np.sin(syaw / 2)]
         self._reset_state()
         mujoco.mj_forward(self.model, self.data)
 
         # Demo loop: snap back to start on a fall or after clearing the course.
         self.auto_reset = False
-        self.reset_x = 6.5
+        self.reset_x = (spec.bounds[1] - 0.5) if spec is not None else 6.5
 
         # Heading-hold: outer P loop keeping the robot straight along y=0 facing
         # +x (the blind policy curves otherwise). Manual A/D overrides it.
@@ -214,8 +226,13 @@ class G1Sim:
         self.spraying = False            # fire scene: water jet on/off
         self.jet_speed = 7.0             # m/s muzzle speed of the water
         self.aim_pitch = NOZZLE_REST_PITCH   # fixed nozzle elevation (no auto-aim)
-        self.fire_health = 1.0           # 1 = burning, 0 = extinguished
-        self._hitting = False            # is the jet currently on the fire?
+        if spec is not None:
+            self.fire_positions = [(fx, fy, 0.0) for fx, fy in spec.fires]
+        else:
+            self.fire_positions = [scenes.FIRE_POSITION_WORLD]
+        self.fire_health = [1.0] * len(self.fire_positions)  # 1 = burning, 0 = out
+        self.targeted_fire = 0               # index of the fire the jet engages
+        self._hitting = False                # is the jet currently on the fire?
         self.fx = None                   # effects.SceneFX (fire scene only)
         self._hose_bid = -1
         self._water = None               # cached per-frame jet path (for ego view)
@@ -282,9 +299,9 @@ class G1Sim:
         return self.spraying
 
     def reignite(self):
-        """Restore the fire to full health (for repeated demo runs)."""
-        self.fire_health = 1.0
-        return self.fire_health
+        """Restore all fires to full health (for repeated demo runs)."""
+        self.fire_health = [1.0] * len(self.fire_positions)
+        return self.fire_health[self.targeted_fire]
 
     @property
     def arm_pose_label(self) -> str:
@@ -305,7 +322,10 @@ class G1Sim:
             "arm_pose": self.arm_pose_label if self.overlay_scene else None,
             "spraying": self.spraying,
             "hitting": self._hitting,
-            "fire_health": self.fire_health,
+            "fires": [{"pos": p, "health": h}
+                      for p, h in zip(self.fire_positions, self.fire_health)],
+            "targeted_fire": self.targeted_fire,
+            "fire_health": self.fire_health[self.targeted_fire],
         }
 
     # -- robot ego camera ---------------------------------------------------- #
@@ -454,19 +474,24 @@ class G1Sim:
             return
         muzzle, direction = mz
         pts, landing = effects.trajectory(muzzle, direction, self.jet_speed)
-        center = np.asarray(scenes.FIRE_POSITION_WORLD, float) + [0, 0, FIRE_AIM_HEIGHT]
+        tidx = self.targeted_fire
+        if tidx >= len(self.fire_positions):
+            tidx = 0
+        pos = self.fire_positions[tidx]
+        center = np.asarray(pos, float) + [0, 0, FIRE_AIM_HEIGHT]
         idx, hit, _ = effects.hit_index(pts, center, HIT_RADIUS)
         self._water, self._water_landing, self._water_hit_idx = pts, landing, idx
-        self._hitting = hit = hit and self.fire_health > 0.0
+        health = self.fire_health[tidx]
+        self._hitting = hit = hit and health > 0.0
         if hit:
-            self.fire_health = max(
-                0.0, self.fire_health - 1.0 / (EXTINGUISH_TIME * RENDER_FPS))
+            self.fire_health[tidx] = max(
+                0.0, health - 1.0 / (EXTINGUISH_TIME * RENDER_FPS))
 
     def _decorate(self, scene):
-        self.fx.decorate(scene, fire_pos=scenes.FIRE_POSITION_WORLD,
-                         water=self._water, landing=self._water_landing,
-                         hit_idx=self._water_hit_idx, hitting=self._hitting,
-                         health=self.fire_health)
+        fires = list(zip(self.fire_positions, self.fire_health))
+        self.fx.decorate(scene, fires=fires, water=self._water,
+                         landing=self._water_landing, hit_idx=self._water_hit_idx,
+                         hitting=self._hitting, targeted_idx=self.targeted_fire)
 
     def render_once(self):
         """Render the current frame to the shared frame buffer. Must run on the
@@ -528,8 +553,11 @@ class G1Sim:
         """Blocking physics loop: 500 Hz sim, 50 Hz policy, paced to real time.
         Rendering runs on its own thread with its own GL context."""
         self._running = True
+        render_thread = None
         if render:
-            threading.Thread(target=self._render_loop, daemon=True).start()
+            render_thread = threading.Thread(
+                target=self._render_loop, daemon=True, name="g1-render")
+            render_thread.start()
         dec = self.control_decimation
         try:
             while self._running:
@@ -558,6 +586,9 @@ class G1Sim:
                     time.sleep(sleep)
         finally:
             self._running = False
+            if render_thread is not None:
+                render_thread.join(timeout=3.0)
+            self._release_render()
 
     def _steer(self):
         """Yaw rate driving heading->heading_target and y->lateral_target."""
@@ -580,6 +611,171 @@ class G1Sim:
     def stop(self):
         self._running = False
 
+    def _release_render(self):
+        """Drop GL resources after the render thread has exited."""
+        self.renderer = None
+        self.cam_renderer = None
+        self.render_model = None
+        self.render_data = None
+        self.fx = None
+
+
+# --------------------------------------------------------------------------- #
+# Scene catalog + hot-swap manager
+# --------------------------------------------------------------------------- #
+_SPECS_DIR = Path(__file__).resolve().parent.parent.parent / "scenes" / "specs"
+_NAMED_LABELS = {"flat": "flat", "obstacles": "obstacles", "fire": "fire"}
+
+
+@dataclass(frozen=True)
+class SceneEntry:
+    key: str
+    label: str
+    kind: Literal["named", "proc"]
+    scene: str | None = None
+    spec_path: Path | None = None
+
+
+def discover_scene_catalog() -> list[SceneEntry]:
+    """Named demos plus every ``scenes/specs/*.json`` (sorted)."""
+    entries = [
+        SceneEntry(key=k, label=_NAMED_LABELS[k], kind="named", scene=k)
+        for k in ("flat", "obstacles", "fire")
+    ]
+    if _SPECS_DIR.is_dir():
+        from .spec import from_json
+        for path in sorted(_SPECS_DIR.glob("*.json")):
+            spec = from_json(path)
+            entries.append(SceneEntry(
+                key=spec.name, label=spec.name, kind="proc", spec_path=path))
+    return entries
+
+
+class SimManager:
+    """Owns the active :class:`G1Sim` and hot-swaps scenes under a lock."""
+
+    def __init__(self, initial_key: str, *, overlay=True, render=True,
+                 loop=False, initial_cmd=None):
+        self._lock = threading.Lock()
+        self._overlay = overlay
+        self._render = render
+        self._loop = loop
+        self._initial_cmd = initial_cmd
+        self.catalog = discover_scene_catalog()
+        self._by_key = {e.key: e for e in self.catalog}
+        if initial_key not in self._by_key:
+            raise ValueError(f"unknown scene key: {initial_key}")
+        self._current_key = initial_key
+        self._physics_thread: threading.Thread | None = None
+        self._retired: list[G1Sim] = []
+        self._switch_unlocked(initial_key, first=True)
+
+    def current_key(self) -> str:
+        with self._lock:
+            return self._current_key
+
+    def catalog_list(self) -> list[dict]:
+        return [{"key": e.key, "label": e.label} for e in self.catalog]
+
+    def sim(self) -> G1Sim:
+        with self._lock:
+            if _SIM is None:
+                raise RuntimeError("no active sim")
+            return _SIM
+
+    def frames(self) -> FrameBuffer:
+        return self.sim().frames
+
+    def cam_frames(self) -> FrameBuffer | None:
+        sim = self.sim()
+        return sim.cam_frames if sim.has_camera else None
+
+    def has_camera(self) -> bool:
+        return self.sim().has_camera
+
+    def switch(self, key: str) -> str:
+        with self._lock:
+            if key not in self._by_key:
+                raise ValueError(f"unknown scene key: {key}")
+            if key == self._current_key:
+                return key
+            return self._switch_unlocked(key)
+
+    def shutdown(self):
+        with self._lock:
+            sim = _SIM
+            if sim is not None:
+                sim.stop()
+            if self._physics_thread is not None:
+                self._physics_thread.join(timeout=5.0)
+                self._physics_thread = None
+
+    def _build_sim(self, entry: SceneEntry) -> G1Sim:
+        if entry.kind == "proc":
+            from .spec import from_json
+            spec = from_json(entry.spec_path)
+            scenes.build(spec)
+            name_12, name_29 = scenes.spec_scene_names(spec.name)
+            scene_path = str(G1_MODEL_DIR / name_12)
+            overlay = (str(G1_MODEL_DIR / name_29)
+                       if self._overlay else None)
+            return G1Sim(scene_path=scene_path, overlay_scene=overlay, spec=spec)
+        scenes.ensure_scenes()
+        scene_path = SCENES[entry.scene]
+        overlay = (OVERLAY_SCENES.get(scene_path) if self._overlay else None)
+        return G1Sim(scene_path=scene_path, overlay_scene=overlay)
+
+    def _apply_policy(self, sim: G1Sim, entry: SceneEntry):
+        if entry.kind == "proc":
+            sim.auto_reset = False
+            sim.heading_hold = False
+            sim.set_command(0.0, 0.0, 0.0)
+        elif entry.scene == "obstacles":
+            sim.auto_reset = self._loop
+            sim.heading_hold = self._loop
+            sim.set_command(0.4, 0.0, 0.0)
+        elif entry.scene == "fire":
+            sim.auto_reset = False
+            sim.heading_hold = False
+            sim.set_command(0.5, 0.0, 0.0)
+        else:
+            sim.auto_reset = False
+            sim.heading_hold = False
+            sim.set_command(0.5, 0.0, 0.0)
+
+    def _switch_unlocked(self, key: str, first: bool = False) -> str:
+        global _SIM
+        retiring: G1Sim | None = None
+        if self._physics_thread is not None:
+            retiring = _SIM
+            if retiring is not None:
+                retiring.stop()
+            self._physics_thread.join(timeout=5.0)
+            self._physics_thread = None
+            if retiring is not None:
+                self._retired.append(retiring)
+            time.sleep(0.15)
+
+        entry = self._by_key[key]
+        sim = self._build_sim(entry)
+        _SIM = sim
+        if first and self._initial_cmd is not None:
+            sim.set_command(*self._initial_cmd)
+            sim.auto_reset = self._loop
+            sim.heading_hold = self._loop
+        else:
+            self._apply_policy(sim, entry)
+
+        def _run():
+            sim.run(render=self._render)
+
+        self._physics_thread = threading.Thread(
+            target=_run, daemon=True, name=f"g1-physics-{key}")
+        self._physics_thread.start()
+        self._current_key = key
+        self._retired.clear()
+        return key
+
 
 # --------------------------------------------------------------------------- #
 # Module-level singleton + simple API (for the fire controller)
@@ -587,10 +783,10 @@ class G1Sim:
 _SIM: G1Sim | None = None
 
 
-def get_sim(scene_path=None, overlay_scene=None) -> G1Sim:
+def get_sim(scene_path=None, overlay_scene=None, spec=None) -> G1Sim:
     global _SIM
     if _SIM is None:
-        _SIM = G1Sim(scene_path=scene_path, overlay_scene=overlay_scene)
+        _SIM = G1Sim(scene_path=scene_path, overlay_scene=overlay_scene, spec=spec)
     return _SIM
 
 
@@ -611,13 +807,15 @@ _PAGE = """<!doctype html><html><head><title>G1 Walk</title>
 <style>body{background:#111;color:#ddd;font-family:monospace;margin:0;text-align:center}
 img{max-width:100%;height:auto;background:#000}
 #hud{position:fixed;top:8px;left:8px;background:rgba(0,0,0,.6);padding:8px;text-align:left;font-size:13px;border-radius:4px;z-index:2}
-#ego{position:fixed;bottom:10px;right:10px;border:2px solid #555;border-radius:4px;background:#000;z-index:2}
+#ego{position:fixed;bottom:10px;right:10px;border:2px solid #555;border-radius:4px;background:#000;z-index:2;display:none}
 #ego img{display:block;width:320px}
 #ego .lbl{position:absolute;top:2px;left:6px;font-size:11px;color:#0f0;text-shadow:0 0 3px #000}
-kbd{background:#333;padding:1px 5px;border-radius:3px}</style></head>
+kbd{background:#333;padding:1px 5px;border-radius:3px}
+#sceneSel{margin:4px 0;font-family:monospace;background:#222;color:#ddd;border:1px solid #555}</style></head>
 <body>
 <div id="hud">
 <b>G1 locomotion</b> (12-DOF walker + kinematic arm overlay)<br>
+scene: <select id="sceneSel"></select><br>
 <kbd>W</kbd>/<kbd>S</kbd> fwd/back &nbsp; <kbd>A</kbd>/<kbd>D</kbd> turn<br>
 <kbd>Q</kbd>/<kbd>E</kbd> strafe &nbsp; <kbd>Space</kbd> stop<br>
 <kbd>H</kbd> auto-steer (re-center) <span id="hh"></span><br>
@@ -628,13 +826,36 @@ cmd: <span id="cmd">0,0,0</span><br>
 <span id="st"></span>
 </div>
 <img src="/stream"/>
-__EGO__
+<div id="ego"><div class="lbl">ROBOT CAM</div><img id="egoImg" src="/camera"/></div>
 <script>
-let vx=0,vy=0,yaw=0;
+let vx=0,vy=0,yaw=0,sceneBusy=false;
 function send(){fetch(`/cmd?vx=${vx}&vy=${vy}&yaw=${yaw}`).then(r=>r.json()).then(d=>{
   document.getElementById('cmd').textContent=d.cmd.map(x=>x.toFixed(2)).join(', ');});}
 function setArm(p){fetch('/arm?pose='+p).then(r=>r.json()).then(d=>{
   document.getElementById('arm').textContent=d.arm_pose;});}
+function setEgo(on){
+  document.getElementById('ego').style.display=on?'block':'none';}
+function loadScenes(){
+  fetch('/scenes').then(r=>r.json()).then(d=>{
+    const sel=document.getElementById('sceneSel');
+    sel.innerHTML='';
+    d.scenes.forEach(s=>{
+      const o=document.createElement('option');
+      o.value=s.key; o.textContent=s.label;
+      if(s.key===d.current) o.selected=true;
+      sel.appendChild(o);});
+    setEgo(!!d.has_camera);});}
+function switchScene(key){
+  if(sceneBusy)return;
+  sceneBusy=true;
+  fetch('/scene?key='+encodeURIComponent(key)).then(r=>{
+    if(!r.ok) throw new Error('switch failed');
+    return r.json();}).then(d=>{
+    setEgo(!!d.has_camera);
+    vx=vy=yaw=0; send();}).catch(()=>{
+    loadScenes();}).finally(()=>{sceneBusy=false;});}
+document.getElementById('sceneSel').addEventListener('change',e=>{
+  switchScene(e.target.value);});
 document.addEventListener('keydown',e=>{
   if(e.repeat)return;
   switch(e.key.toLowerCase()){
@@ -665,10 +886,11 @@ setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
     d.fire_health<=0?'\u2713 OUT':(d.spraying?(d.hitting?'\u25c9 HIT':'\u2715 MISS'):'');
   document.getElementById('st').textContent=
     `pos ${d.pos.map(x=>x.toFixed(2))} ${d.fell?'\u26a0 FELL':'ok'}`;});},500);
+loadScenes();
 </script></body></html>"""
 
 
-def _make_app(sim: G1Sim):
+def _make_app(mgr: SimManager):
     from flask import jsonify, request
 
     def register(app):
@@ -677,69 +899,92 @@ def _make_app(sim: G1Sim):
             def f(name):
                 v = request.args.get(name)
                 return float(v) if v is not None else None
+            sim = mgr.sim()
             c = sim.set_command(vx=f("vx"), vy=f("vy"), yaw=f("yaw"))
             return jsonify(cmd=c.tolist())
 
         @app.route("/heading")
         def heading():
             on = request.args.get("on", "1") not in ("0", "false", "")
-            sim.set_heading_hold(on)
+            mgr.sim().set_heading_hold(on)
             return jsonify(heading_hold=on)
 
         @app.route("/arm")
         def arm():
+            sim = mgr.sim()
             return jsonify(arm_pose=sim.set_overlay_arm_pose(
                 request.args.get("pose", "carry")))
 
         @app.route("/spray")
         def spray():
             on = request.args.get("on")
-            return jsonify(spraying=sim.set_spray(
+            return jsonify(spraying=mgr.sim().set_spray(
                 None if on is None else on not in ("0", "false", "")))
 
         @app.route("/reignite")
         def reignite():
-            return jsonify(fire_health=sim.reignite())
+            return jsonify(fire_health=mgr.sim().reignite())
 
-        if sim.has_camera:
-            @app.route("/camera")
-            def camera():
-                return mjpeg_response(sim.cam_frames, RENDER_FPS)
+        @app.route("/scenes")
+        def scenes_list():
+            return jsonify(scenes=mgr.catalog_list(), current=mgr.current_key(),
+                           has_camera=mgr.has_camera())
+
+        @app.route("/scene")
+        def scene_switch():
+            key = request.args.get("key") or request.args.get("name")
+            if not key:
+                return jsonify(error="missing key"), 400
+            try:
+                mgr.switch(key)
+            except ValueError as e:
+                return jsonify(error=str(e)), 400
+            return jsonify(current=mgr.current_key(), has_camera=mgr.has_camera())
+
+        @app.route("/camera")
+        def camera():
+            if not mgr.has_camera():
+                return "", 404
+            return mjpeg_response(mgr.cam_frames, RENDER_FPS)
 
     def state_fn():
-        s = sim.get_state()
+        s = mgr.sim().get_state()
         return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
                     fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
                     arm_pose=s["arm_pose"], spraying=bool(s["spraying"]),
-                    hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]))
+                    hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]),
+                    fires=[{"pos": list(f["pos"]), "health": float(f["health"])}
+                           for f in s["fires"]],
+                    targeted_fire=int(s["targeted_fire"]))
 
-    ego = ('<div id="ego"><div class="lbl">ROBOT CAM</div>'
-           '<img src="/camera"/></div>') if sim.has_camera else ""
-    page = _PAGE.replace("__EGO__", ego)
-    return create_app(page_html=page, frame_buffer=sim.frames,
+    return create_app(page_html=_PAGE, frame_source=mgr.frames,
                       state_fn=state_fn, register_routes=register)
 
 
 def start(block=True, serve_web=True, port=8088, render=True, initial_cmd=None,
-          scene="flat", loop=False, overlay=True):
-    """Start the sim. With block=False, runs the loop on a background thread."""
-    scenes.ensure_scenes()
-    scene_path = SCENES.get(scene, scene)
-    overlay_scene = OVERLAY_SCENES.get(scene_path) if overlay else None
-    sim = get_sim(scene_path=scene_path, overlay_scene=overlay_scene)
-    sim.auto_reset = loop
-    sim.heading_hold = loop
-    if initial_cmd is not None:
-        sim.set_command(*initial_cmd)
+          scene="flat", loop=False, overlay=True, spec=None):
+    """Start the sim. With block=False, runs the loop on a background thread.
+
+    Pass a ``SceneSpec`` via ``spec`` to run a procedural scene: the XMLs are
+    (re)built from it and the robot spawns at ``spec.start``."""
+    if spec is not None:
+        initial_key = spec.name
+    else:
+        initial_key = scene if scene in SCENES else "flat"
+
+    mgr = SimManager(initial_key, overlay=overlay, render=render,
+                     loop=loop, initial_cmd=initial_cmd)
 
     if serve_web:
-        serve(_make_app(sim), port, label="G1 walker")
+        serve(_make_app(mgr), port, label="G1 walker")
 
     if block:
-        sim.run(render=render)
-    else:
-        threading.Thread(target=lambda: sim.run(render=render), daemon=True).start()
-    return sim
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            mgr.shutdown()
+    return mgr.sim()
 
 
 def main():
@@ -748,6 +993,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene", default="flat", help="flat | obstacles | <path.xml>")
+    p.add_argument("--spec", default=None,
+                   help="path to a SceneSpec JSON (procedural scene; spawns at start)")
     p.add_argument("--idle", action="store_true",
                    help="stand still until commanded (default: walk forward)")
     p.add_argument("--vx", type=float, default=None, help="initial forward speed")
@@ -759,12 +1006,19 @@ def main():
                    help="render the bare 12-DOF body (no arms)")
     args = p.parse_args()
 
-    default_vx = 0.4 if args.scene == "obstacles" else 0.5
+    spec = None
+    if args.spec:
+        from ember.spec import from_json
+        spec = from_json(args.spec)
+
+    # Procedural scenes have walls; stand still by default so the blind walker
+    # doesn't march into one. Named demo scenes keep their walk-forward default.
+    default_vx = 0.0 if spec is not None else (0.4 if args.scene == "obstacles" else 0.5)
     vx = 0.0 if args.idle else (args.vx if args.vx is not None else default_vx)
     loop = (args.scene == "obstacles") if args.loop is None else args.loop
     start(block=True, serve_web=True, port=args.port,
           initial_cmd=(vx, 0.0, 0.0), scene=args.scene, loop=loop,
-          overlay=args.overlay)
+          overlay=args.overlay, spec=spec)
 
 
 if __name__ == "__main__":

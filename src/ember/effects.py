@@ -6,6 +6,9 @@ ballistic water jet (and whether it reaches the fire), and :class:`SceneFX`
 animates the flame (``animate``) and injects the transient water/steam/smoke/
 ember geoms into a renderer's ``MjvScene`` (``decorate``). Nothing touches
 physics -- it's pure decoration, and on non-fire scenes ``SceneFX`` is a no-op.
+
+Flame bodies are named ``flame0..N`` with paired lights ``firelight{i}a`` /
+``firelight{i}b`` per fire (see :func:`ember.scenes.flame_bodies`).
 """
 from __future__ import annotations
 
@@ -15,9 +18,13 @@ import numpy as np
 _GT = mujoco.mjtGeom
 GRAVITY = 9.81
 
-FLAME_BODY = "flame"
-FIRE_LIGHTS = ("firelight", "firelight2")
+_FLAME_PREFIX = "flame"
 _FIRE_RGB = np.array([1.0, 0.5, 0.18])
+
+
+def _flame_light_names(index: int) -> tuple[str, str]:
+    """Lower / upper fire-light names for ``flame{index}``."""
+    return f"firelight{index}a", f"firelight{index}b"
 
 
 def trajectory(muzzle, direction, speed, *, ground_z=0.0, dt=0.02, max_steps=200):
@@ -54,53 +61,69 @@ class SceneFX:
 
     def __init__(self, model):
         BODY, LIGHT = mujoco.mjtObj.mjOBJ_BODY, mujoco.mjtObj.mjOBJ_LIGHT
-        bid = mujoco.mj_name2id(model, BODY, FLAME_BODY)
-        self.active = bid >= 0
+        self._flames: list[dict] = []
+        idx = 0
+        while True:
+            name = f"{_FLAME_PREFIX}{idx}"
+            bid = mujoco.mj_name2id(model, BODY, name)
+            if bid < 0:
+                break
+            g0 = model.body_geomadr[bid]
+            lights = [i for i in
+                      (mujoco.mj_name2id(model, LIGHT, n)
+                       for n in _flame_light_names(idx))
+                      if i >= 0]
+            self._flames.append({
+                "gslice": slice(g0, g0 + model.body_geomnum[bid]),
+                "base_pos": model.geom_pos[g0:g0 + model.body_geomnum[bid]].copy(),
+                "base_size": model.geom_size[g0:g0 + model.body_geomnum[bid]].copy(),
+                "lights": lights,
+            })
+            idx += 1
+        self.active = bool(self._flames)
         if not self.active:
             return
-        g0 = model.body_geomadr[bid]
-        self._gslice = slice(g0, g0 + model.body_geomnum[bid])
-        self._flame_base_pos = model.geom_pos[self._gslice].copy()
-        self._flame_base_size = model.geom_size[self._gslice].copy()
-        self._lights = [i for i in
-                        (mujoco.mj_name2id(model, LIGHT, n) for n in FIRE_LIGHTS)
-                        if i >= 0]
         self._rng = np.random.default_rng()
 
-    def animate(self, model, health=1.0):
-        """Flicker the fire lights, jitter the flame, and scale it by ``health``
-        (1 = full, 0 = out). Mutates ``model`` arrays, so call once per frame
-        just before ``mj_forward``."""
+    def animate(self, model, health_list):
+        """Flicker each fire's lights, jitter its flame, and scale by its
+        ``health_list`` entry (1 = full, 0 = out). Mutates ``model`` arrays, so
+        call once per frame just before ``mj_forward``."""
         if not self.active:
             return
         r = self._rng
-        h = max(health, 0.0)
-        model.geom_size[self._gslice] = self._flame_base_size * (0.15 + 0.85 * h)
-        model.geom_pos[self._gslice] = (
-            self._flame_base_pos + r.normal(0, 0.02 * h, self._flame_base_pos.shape))
-        for lid in self._lights:
-            model.light_diffuse[lid] = _FIRE_RGB * h * (0.7 + 0.5 * r.random())
+        for i, flame in enumerate(self._flames):
+            h = max(health_list[i] if i < len(health_list) else 0.0, 0.0)
+            gslice = flame["gslice"]
+            model.geom_size[gslice] = flame["base_size"] * (0.15 + 0.85 * h)
+            model.geom_pos[gslice] = (
+                flame["base_pos"] + r.normal(0, 0.02 * h, flame["base_pos"].shape))
+            for lid in flame["lights"]:
+                model.light_diffuse[lid] = _FIRE_RGB * h * (0.7 + 0.5 * r.random())
 
-    def decorate(self, scene, *, fire_pos, water=None, landing=None,
-                 hit_idx=None, hitting=False, health=1.0):
-        """Inject transient FX geoms into ``scene``. ``water`` is the ballistic
-        path (Nx3) to draw; ``hitting`` adds steam at the fire and truncates the
-        stream at ``hit_idx``; otherwise the stream runs to ``landing`` and
-        splashes there. Smoke + embers scale with ``health`` (skipped once out)."""
+    def decorate(self, scene, *, fires=None, water=None, landing=None,
+                 hit_idx=None, hitting=False, targeted_idx=0):
+        """Inject transient FX geoms into ``scene``. ``fires`` is
+        ``[(pos, health), ...]``; smoke/embers draw for every burning fire.
+        ``water`` is the ballistic path (Nx3) aimed at ``targeted_idx``;
+        ``hitting`` adds steam at that fire and truncates the stream at
+        ``hit_idx``; otherwise the stream runs to ``landing`` and splashes there."""
         if not self.active:
             return
+        fires = fires or []
         r = self._rng
-        fire = np.asarray(fire_pos, float)
         if water is not None and len(water) > 1:
             end = hit_idx + 1 if (hitting and hit_idx is not None) else len(water)
             self._stream(scene, water[:end])
-            if hitting:
-                self._steam(scene, fire, r)
+            if hitting and fires and 0 <= targeted_idx < len(fires):
+                self._steam(scene, np.asarray(fires[targeted_idx][0], float), r)
             elif landing is not None:
                 self._splash(scene, np.asarray(landing, float), r)
-        if health > 0.02:
-            self._smoke(scene, fire, r, health)
-            self._embers(scene, fire, r, health)
+        for pos, health in fires:
+            if health > 0.02:
+                fire = np.asarray(pos, float)
+                self._smoke(scene, fire, r, health)
+                self._embers(scene, fire, r, health)
 
     # -- transient geom builders -------------------------------------------- #
     def _stream(self, scene, pts):

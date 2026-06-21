@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import threading
 import time
-from typing import Callable
+from typing import Callable, Union
 
 from PIL import Image
 
@@ -39,15 +39,29 @@ class FrameBuffer:
             return self._jpeg
 
 
-def mjpeg_response(frame_buffer: FrameBuffer, fps: float = RENDER_FPS):
-    """A Flask streaming Response that serves a FrameBuffer as MJPEG."""
+FrameSource = Union[FrameBuffer, Callable[[], FrameBuffer | None]]
+
+
+def _resolve_buffer(source: FrameSource) -> FrameBuffer | None:
+    if callable(source):
+        return source()
+    return source
+
+
+def mjpeg_response(frame_source: FrameSource, fps: float = RENDER_FPS):
+    """Flask MJPEG stream from a :class:`FrameBuffer` or a zero-arg callable
+    that returns the current buffer (re-fetched each frame for hot-swaps)."""
     from flask import Response
 
     def gen():
         boundary = b"--frame"
         interval = 1.0 / fps
         while True:
-            jpeg = frame_buffer.get()
+            buf = _resolve_buffer(frame_source)
+            if buf is None:
+                time.sleep(0.03)
+                continue
+            jpeg = buf.get()
             if jpeg is None:
                 time.sleep(0.03)
                 continue
@@ -63,16 +77,19 @@ def mjpeg_response(frame_buffer: FrameBuffer, fps: float = RENDER_FPS):
 def create_app(
     *,
     page_html: str,
-    frame_buffer: FrameBuffer,
+    frame_buffer: FrameBuffer | None = None,
+    frame_source: FrameSource | None = None,
     state_fn: Callable[[], dict],
     register_routes: Callable[["Flask"], None] | None = None,
     fps: float = RENDER_FPS,
 ):
     """Build the Flask app: ``/`` (page), ``/stream`` (MJPEG), ``/state``
     (JSON). Demo-specific control endpoints (and extra feeds) are added via
-    ``register_routes``.
-    """
+    ``register_routes``. Pass ``frame_source`` (or legacy ``frame_buffer``)
+    for the MJPEG feed."""
     from flask import Flask, jsonify
+
+    src: FrameSource = frame_source if frame_source is not None else frame_buffer
 
     app = Flask(__name__)
 
@@ -82,7 +99,7 @@ def create_app(
 
     @app.route("/stream")
     def stream():
-        return mjpeg_response(frame_buffer, fps)
+        return mjpeg_response(src, fps)
 
     @app.route("/state")
     def state():
