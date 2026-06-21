@@ -4,8 +4,12 @@ verilog xil_defaultlib  \
 "../../../../Fire_Detection_Accelerator.srcs/sources_1/new/addr_gen.v" \
 "../../../../Fire_Detection_Accelerator.srcs/sources_1/new/fire_detect.v" \
 "../../../../Fire_Detection_Accelerator.srcs/sources_1/new/image_rom.v" \
+"../../../../Fire_Detection_Accelerator.srcs/sources_1/new/uart_tx_bytes.v" \
 "../../../../Fire_Detection_Accelerator.srcs/sources_1/new/top.v" \
+"../../../../Fire_Detection_Accelerator.srcs/sim_1/new/tb_addr_gen.v" \
+"../../../../Fire_Detection_Accelerator.srcs/sources_1/new/tb_image_rom.v" \
 "../../../../Fire_Detection_Accelerator.srcs/sim_1/new/tb_top.v" \
+"../../../../Fire_Detection_Accelerator.srcs/sim_1/new/tb_uart_tx.v" \
 
 # compile glbl module
 verilog xil_defaultlib "glbl.v"

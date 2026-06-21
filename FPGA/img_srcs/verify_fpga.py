@@ -16,19 +16,16 @@ Y_MIN    = 120
 CR_MIN   = 150
 CB_MAX   = 120
 CRCB_GAP = 20
+BASE_FRACTION_SHIFT = 3   # divide flame height by 2^3 = 8  (~12.5%, matches Verilog >>3)
 
 
 def ask_filename(value, prompt, must_exist=True):
     while True:
         path = value if value else input(prompt).strip().strip('"').strip("'")
         if not path:
-            print("  (no filename entered, try again)")
-            value = None
-            continue
+            print("  (no filename entered, try again)"); value = None; continue
         if must_exist and not os.path.isfile(path):
-            print(f"  ERROR: file not found: {path}")
-            value = None
-            continue
+            print(f"  ERROR: file not found: {path}"); value = None; continue
         return path
 
 
@@ -36,13 +33,11 @@ def ask_int(prompt):
     while True:
         s = input(prompt).strip()
         if s == "":
-            print("  please enter a whole number")
-            continue
+            print("  please enter a whole number"); continue
         try:
             v = int(s)
             if v < 0:
-                print("  value can't be negative, try again")
-                continue
+                print("  value can't be negative, try again"); continue
             return v
         except ValueError:
             print("  not a valid integer, try again")
@@ -53,16 +48,13 @@ def load_yuv(mem_path):
         with open(mem_path) as f:
             lines = [ln.strip() for ln in f if ln.strip()]
     except Exception as e:
-        print(f"ERROR: could not read '{mem_path}': {e}")
-        sys.exit(1)
+        print(f"ERROR: could not read '{mem_path}': {e}"); sys.exit(1)
     if len(lines) != WIDTH * HEIGHT:
-        print(f"ERROR: '{mem_path}' has {len(lines)} pixels, expected {WIDTH*HEIGHT}.")
-        sys.exit(1)
+        print(f"ERROR: '{mem_path}' has {len(lines)} pixels, expected {WIDTH*HEIGHT}."); sys.exit(1)
     try:
         words = [int(ln, 16) for ln in lines]
     except ValueError as e:
-        print(f"ERROR: '{mem_path}' contains a non-hex line: {e}")
-        sys.exit(1)
+        print(f"ERROR: '{mem_path}' contains a non-hex line: {e}"); sys.exit(1)
     Y  = np.array([(w >> 16) & 0xFF for w in words]).reshape(HEIGHT, WIDTH)
     Cb = np.array([(w >> 8)  & 0xFF for w in words]).reshape(HEIGHT, WIDTH)
     Cr = np.array([ w        & 0xFF for w in words]).reshape(HEIGHT, WIDTH)
@@ -73,7 +65,9 @@ def compute_golden(Y, Cb, Cr):
     is_fire = (Y > Y_MIN) & (Cr > CR_MIN) & (Cb < CB_MAX) & (Cr > Cb + CRCB_GAP)
     count = int(is_fire.sum())
     ys, xs = np.where(is_fire)
-    return count, int(xs.sum()), int(ys.sum())
+    if count == 0:
+        return count, 0, 0, 0, 0
+    return count, int(xs.sum()), int(ys.sum()), int(ys.min()), int(ys.max())
 
 
 def yuv_to_rgb_image(Y, Cb, Cr):
@@ -92,7 +86,7 @@ def draw_crosshair(draw, cx, cy, color, size=18, width=2):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Verify FPGA numbers vs golden, render image with both centroids.")
+    ap = argparse.ArgumentParser(description="Verify FPGA numbers + draw centroid and flame-base target.")
     ap.add_argument("mem", nargs="?", help=".mem file (default: image.mem)")
     ap.add_argument("-o", "--out", default=None, help="output PNG (default: verify_result_<memname>.png)")
     args = ap.parse_args()
@@ -100,7 +94,6 @@ def main():
     mem_path = ask_filename(args.mem or "image.mem",
                             "Reference .mem filename [image.mem]: ", must_exist=True)
 
-    # default output name derived from the .mem filename
     if args.out:
         out_path = args.out
     else:
@@ -110,18 +103,22 @@ def main():
         out_path = os.path.join(mem_dir, out_name) if mem_dir else out_name
 
     Y, Cb, Cr = load_yuv(mem_path)
-    g_count, g_sum_x, g_sum_y = compute_golden(Y, Cb, Cr)
+    g_count, g_sum_x, g_sum_y, g_min_y, g_max_y = compute_golden(Y, Cb, Cr)
 
     print("\nEnter the values your FPGA reported:")
     fpga_count = ask_int("  count = ")
     fpga_sum_x = ask_int("  sum_x = ")
     fpga_sum_y = ask_int("  sum_y = ")
+    fpga_min_y = ask_int("  min_y = ")
+    fpga_max_y = ask_int("  max_y = ")
 
     print("\n---- COMPARISON ----")
     print(f"{'':10} {'FPGA':>10} {'GOLDEN':>10} {'RESULT':>14}")
     rows = [("count", fpga_count, g_count),
             ("sum_x", fpga_sum_x, g_sum_x),
-            ("sum_y", fpga_sum_y, g_sum_y)]
+            ("sum_y", fpga_sum_y, g_sum_y),
+            ("min_y", fpga_min_y, g_min_y),
+            ("max_y", fpga_max_y, g_max_y)]
     all_ok = True
     for name, fpga, gold in rows:
         ok = (fpga == gold)
@@ -129,13 +126,28 @@ def main():
         flag = "OK" if ok else f"OFF by {fpga - gold:+d}"
         print(f"{name:10} {fpga:>10} {gold:>10} {flag:>14}")
 
-    fpga_centroid = (fpga_sum_x // fpga_count, fpga_sum_y // fpga_count) if fpga_count > 0 else None
-    gold_centroid = (g_sum_x // g_count, g_sum_y // g_count) if g_count > 0 else None
+    # compute targets (use FPGA numbers, integer math matching the Verilog/downstream)
+    fpga_centroid = base_target = None
+    gold_centroid = gold_base   = None
+    if fpga_count > 0:
+        cx = fpga_sum_x // fpga_count
+        cy = fpga_sum_y // fpga_count
+        fh = fpga_max_y - fpga_min_y
+        ty = fpga_max_y - (fh >> BASE_FRACTION_SHIFT)
+        fpga_centroid = (cx, cy)
+        base_target   = (cx, ty)        # x = centroid x, y = base-biased
+    if g_count > 0:
+        gcx = g_sum_x // g_count
+        gcy = g_sum_y // g_count
+        gfh = g_max_y - g_min_y
+        gty = g_max_y - (gfh >> BASE_FRACTION_SHIFT)
+        gold_centroid = (gcx, gcy)
+        gold_base     = (gcx, gty)
 
-    if fpga_centroid and gold_centroid:
-        print(f"\ncentroid   FPGA={fpga_centroid}   GOLDEN={gold_centroid}")
-    elif g_count == 0:
-        print("\nNOTE: golden count is 0 — this image has no fire pixels.")
+    if base_target:
+        print(f"\ncentroid    = {fpga_centroid}")
+        print(f"flame height = {fpga_max_y - fpga_min_y}")
+        print(f">>> BASE TARGET = {base_target}  (robot aims here)")
 
     print("\n>>> " + ("ALL MATCH — FPGA agrees with golden reference"
                       if all_ok else
@@ -144,27 +156,29 @@ def main():
     if not all_ok:
         print("\nDiagnosis:")
         if fpga_count != g_count:
-            print(" - count off => threshold mismatch (fire_detect.v must be")
-            print("   Y>120, Cr>150, Cb<120, Cr>Cb+20) or a frame-boundary/reset issue.")
-        elif fpga_sum_x != g_sum_x or fpga_sum_y != g_sum_y:
-            print(" - count matches but sums don't => 1-CLOCK ALIGNMENT bug.")
-            print("   Check x_d/y_d/valid_d delay registers in top.v.")
+            print(" - count off => threshold mismatch or frame-boundary issue.")
+        elif (fpga_sum_x != g_sum_x or fpga_sum_y != g_sum_y):
+            print(" - count matches, sums don't => 1-clock ALIGNMENT bug (top.v delay regs).")
+        elif (fpga_min_y != g_min_y or fpga_max_y != g_max_y):
+            print(" - min/max y off => check the min/max logic in accumulator.v.")
 
-    # ---- render with crosshairs ----
+    # ---- render ----
     img = yuv_to_rgb_image(Y, Cb, Cr)
     draw = ImageDraw.Draw(img)
+    # golden centroid (faint red), FPGA centroid (green), BASE TARGET (bright yellow, big)
     if gold_centroid:
-        draw_crosshair(draw, gold_centroid[0], gold_centroid[1], (255, 0, 0))   # red = golden
+        draw_crosshair(draw, gold_centroid[0], gold_centroid[1], (180, 0, 0), size=12, width=1)
     if fpga_centroid:
-        draw_crosshair(draw, fpga_centroid[0], fpga_centroid[1], (0, 255, 0))   # green = FPGA
+        draw_crosshair(draw, fpga_centroid[0], fpga_centroid[1], (0, 255, 0), size=14, width=2)
+    if base_target:
+        draw_crosshair(draw, base_target[0], base_target[1], (255, 230, 0), size=22, width=3)
 
     try:
         img.save(out_path)
         print(f"\nSaved {out_path}")
-        print("  RED crosshair   = golden (computed-from-image) centroid")
-        print("  GREEN crosshair = FPGA-reported centroid")
-        if fpga_centroid and gold_centroid:
-            print("  (overlapping => perfect agreement; separated => that gap is your error)")
+        print("  faint RED  = centroid (golden)")
+        print("  GREEN      = centroid (FPGA)")
+        print("  YELLOW big = FLAME BASE TARGET (what the robot aims at)")
     except Exception as e:
         print(f"ERROR: could not save image '{out_path}': {e}")
 
