@@ -12,11 +12,8 @@ Sign conventions (verified by rendering on the G1):
 
 - **shoulder_pitch** (axis Y): negative raises the arm forward/up.
 - The right arm mirrors the roll/yaw signs so the two hands meet at the centre.
-- **Hands are mirror images**: the left finger-curl joints have a *negative*
-  range (``[-1.57, 0]``) while the right ones are *positive* (``[0, 1.57]``).
-  A single shared magnitude (the old ``0.6`` for every finger) drove the left
-  fingers out of range -- that was the source of the mangled digits. Each hand
-  therefore gets its own explicit angle set below.
+- **Hands mirror**: left finger-curl joints have a negative range, right ones
+  positive, so each hand gets its own explicit angle set below.
 """
 from __future__ import annotations
 

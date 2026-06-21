@@ -86,7 +86,9 @@ def obstacle_geoms(bump_x=1.2, bump_radius=0.30, bump_expose=0.07,
 
 def fire_geom(pos=FIRE_POSITION_WORLD) -> str:
     """A bright flame prop: orange body + yellow tip. Non-colliding (contype=0)
-    so the robot can walk up to it; it's a visual target for the detector."""
+    so the robot can walk up to it; it's a visual target for the detector. Used
+    only by the bare 12-DOF fire scene; the overlay scene gets the richer
+    emissive flame (:func:`flame_body`)."""
     x, y, z = pos
     return "\n    ".join([
         f'<geom name="fire_base" type="cylinder" size="0.18 0.30" '
@@ -96,6 +98,51 @@ def fire_geom(pos=FIRE_POSITION_WORLD) -> str:
         f'pos="{x} {y} {z + 0.72}" rgba="1.0 0.80 0.10 1" '
         f'contype="0" conaffinity="0"/>',
     ])
+
+
+# Emissive flame: translucent red/orange shells (wide base -> narrow top) over
+# an opaque white-hot core, plus two flickering fire lights. ember.effects
+# animates these and adds the runtime smoke/embers/water.
+_FLAME_MATERIALS = (
+    ("m_core", "1.0 0.95 0.70 1.0", 1.0),   # white-hot core (opaque)
+    ("m_mid", "1.0 0.60 0.15 0.55", 0.95),  # orange shell (translucent)
+    ("m_out", "0.95 0.25 0.06 0.32", 0.85),  # red tongues (translucent)
+)
+# (material, size sx sy sz, pos px py pz) in the flame-body frame.
+_FLAME_GEOMS = (
+    ("m_out", "0.30 0.30 0.22", "0 0 0.22"),
+    ("m_out", "0.24 0.24 0.24", "0.03 0.02 0.48"),
+    ("m_out", "0.16 0.16 0.26", "-0.03 0.03 0.74"),
+    ("m_out", "0.09 0.09 0.22", "0.02 -0.02 0.98"),
+    ("m_mid", "0.20 0.20 0.20", "0 0 0.24"),
+    ("m_mid", "0.14 0.14 0.22", "0.02 0.01 0.50"),
+    ("m_mid", "0.08 0.08 0.18", "-0.02 0.02 0.74"),
+    ("m_core", "0.12 0.12 0.16", "0 0 0.26"),
+    ("m_core", "0.07 0.07 0.14", "0.01 0 0.46"),
+)
+
+
+def flame_assets() -> str:
+    """``<asset>`` block with the emissive flame materials."""
+    mats = "\n    ".join(
+        f'<material name="{n}" rgba="{rgba}" emission="{e}"/>'
+        for n, rgba, e in _FLAME_MATERIALS)
+    return f"\n  <asset>\n    {mats}\n  </asset>"
+
+
+def flame_body(pos=FIRE_POSITION_WORLD) -> str:
+    """Emissive flame body + two flickering fire lights at ``pos``."""
+    x, y, z = pos
+    geoms = "\n      ".join(
+        f'<geom type="ellipsoid" size="{size}" pos="{gpos}" material="{mat}" '
+        f'contype="0" conaffinity="0"/>'
+        for mat, size, gpos in _FLAME_GEOMS)
+    return (
+        f'<body name="flame" pos="{x} {y} {z}">\n      {geoms}\n    </body>\n'
+        f'    <light name="firelight" pos="{x} {y} {z + 0.45}" dir="0 0 -1" '
+        f'diffuse="1.0 0.5 0.18" specular="0.5 0.25 0.06" attenuation="0.25 0 0.04"/>\n'
+        f'    <light name="firelight2" pos="{x - 0.3} {y} {z + 0.9}" dir="0 0 -1" '
+        f'diffuse="1.0 0.5 0.18" specular="0.5 0.25 0.06" attenuation="0.4 0 0.06"/>')
 
 
 def _scene_12(model_label: str, statistic: str, body_extra: str = "") -> str:
@@ -113,14 +160,16 @@ def _scene_12(model_label: str, statistic: str, body_extra: str = "") -> str:
 """
 
 
-def _scene_29(model_label: str, statistic: str, body_extra: str = "") -> str:
+def _scene_29(model_label: str, statistic: str, body_extra: str = "",
+              asset_extra: str = "") -> str:
     """A 29-DOF (render overlay) scene: the model ships its own floor/sky/light,
-    so we only add obstacle geoms. Offscreen size is set in Python at load."""
+    so we only add obstacle/flame geoms. Offscreen size is set in Python at
+    load."""
     body = f"\n  <worldbody>\n    {body_extra}\n  </worldbody>" if body_extra else ""
     return f"""<mujoco model="{model_label}">
   <include file="{MODEL_29}"/>
   {statistic}
-{_VISUAL}{body}
+{_VISUAL}{asset_extra}{body}
 </mujoco>
 """
 
@@ -142,7 +191,7 @@ def render_scene(name: str) -> str:
                          fire_geom())
     if name == FIRE_29:
         return _scene_29("g1 fire 29dof render", '<statistic center="2 0 0.8" extent="3"/>',
-                         fire_geom())
+                         flame_body(), flame_assets())
     raise ValueError(f"unknown scene: {name}")
 
 

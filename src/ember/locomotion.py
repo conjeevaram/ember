@@ -7,10 +7,8 @@ vector -- see :meth:`G1Sim.set_command` / :func:`send_velocity_command`.
 
 Arms: the 12-DOF model's arms are welded decoration, so for rendering we drive a
 full 29-DOF (with hands) body whose base + 12 legs are copied from the physics
-sim every frame, with the arms posed kinematically (carry hose / aim). This
-gives an articulated, posable upper body on top of the bulletproof walker -- no
-extra physics, no retraining. The analytic fire-aim later sets the arm pose
-exactly, which is ideal (no PD tracking error).
+sim every frame, with the arms posed kinematically (carry hose / aim) -- an
+articulated, posable upper body on the bulletproof walker, no extra physics.
 
 Run:
     python -m ember.locomotion --scene obstacles
@@ -33,7 +31,7 @@ import numpy as np
 import torch
 import yaml
 
-from . import arms, scenes
+from . import arms, effects, scenes
 from .config import (CAM_FOVY, CAM_H, CAM_W, DEPLOY_CONFIG_PATH, G1_MODEL_DIR,
                      POLICY_PATH, RENDER_FPS, RENDER_H, RENDER_W, VX_RANGE,
                      VY_RANGE, YAW_RANGE, clamp, gravity_orientation, quat_yaw)
@@ -58,12 +56,22 @@ def _ego_camera_quat(tilt_deg: float) -> list[float]:
     return q.tolist()
 
 
-# Fire-hose fog nozzle prop. Welded to torso_link so it tracks the body as the
-# robot walks/turns -- the hands (also children of torso via the arms) hold it
-# in the "carry" pose. Offset/orientation tuned by rendering against that pose:
-# the barrel runs forward (+x) through both hands at chest height, head out
-# front, maroon supply hose trailing down behind (firefighter brace stance).
+# Fog-nozzle prop, welded under torso_link (the hands hold it in the "carry"
+# pose); offset/orientation tuned by rendering against that pose.
 HOSE_TORSO_OFFSET = (0.439, 0.101, 0.037)
+HOSE_BARREL_TILT = 1.65   # barrel axis, rad from +Z toward +X (slight down-aim)
+NOZZLE_REACH = 0.21       # hose origin -> muzzle tip, along the barrel
+# Nozzle elevation hinge (about torso +Y; negative raises the barrel), posed
+# kinematically since the overlay is never stepped.
+NOZZLE_JOINT = "nozzle_pitch_joint"
+NOZZLE_PITCH_RANGE = (-1.0, 0.3)
+NOZZLE_REST_PITCH = -0.08  # fixed ~level elevation (no auto-aim)
+
+# Fire engagement: the jet must pass within HIT_RADIUS of the fire centre, and
+# the fire goes out only after EXTINGUISH_TIME of cumulative on-target hits.
+FIRE_AIM_HEIGHT = 0.45
+HIT_RADIUS = 0.25
+EXTINGUISH_TIME = 10.0
 
 
 def _y_quat(phi: float) -> list[float]:
@@ -77,22 +85,27 @@ def _attach_hose(spec) -> None:
     body = spec.body("torso_link").add_body()
     body.name = "hose"
     body.pos = list(HOSE_TORSO_OFFSET)
-    barrel = 1.65  # barrel axis: forward (+x) with a slight downward aim
+    j = body.add_joint()
+    j.name = NOZZLE_JOINT
+    j.type = mujoco.mjtJoint.mjJNT_HINGE
+    j.axis = [0, 1, 0]
+    j.range = list(NOZZLE_PITCH_RANGE)
+    barrel = HOSE_BARREL_TILT
     bq = _y_quat(barrel)
     d = (math.sin(barrel), 0.0, math.cos(barrel))
 
-    def fx(s):  # point a distance s along the barrel axis from the grip centre
+    def along(s):  # point a distance s along the barrel axis from the grip centre
         return [d[0] * s, d[1] * s, d[2] * s]
 
     # name, type, size, pos, quat, rgba
     parts = [
         ("hose_barrel", GT.mjGEOM_CYLINDER, [0.026, 0.12, 0], [0, 0, 0], bq,
          [0.15, 0.15, 0.17, 1]),
-        ("hose_head", GT.mjGEOM_CYLINDER, [0.045, 0.035, 0], fx(0.15), bq,
+        ("hose_head", GT.mjGEOM_CYLINDER, [0.045, 0.035, 0], along(0.15), bq,
          [0.10, 0.10, 0.12, 1]),
-        ("hose_face", GT.mjGEOM_CYLINDER, [0.042, 0.006, 0], fx(0.188), bq,
+        ("hose_face", GT.mjGEOM_CYLINDER, [0.042, 0.006, 0], along(0.188), bq,
          [0.85, 0.68, 0.12, 1]),
-        ("hose_coupling", GT.mjGEOM_CYLINDER, [0.030, 0.020, 0], fx(-0.13), bq,
+        ("hose_coupling", GT.mjGEOM_CYLINDER, [0.030, 0.020, 0], along(-0.13), bq,
          [0.72, 0.55, 0.20, 1]),
         ("hose_bale", GT.mjGEOM_CYLINDER, [0.011, 0.05, 0],
          [d[0] * -0.05, 0, d[2] * -0.05 + 0.055], _y_quat(-0.40),
@@ -184,8 +197,7 @@ class G1Sim:
         self.reset_x = 6.5
 
         # Heading-hold: outer P loop keeping the robot straight along y=0 facing
-        # +x (the blind policy curves otherwise). Same machinery later steers
-        # toward a fire. Manual A/D overrides it.
+        # +x (the blind policy curves otherwise). Manual A/D overrides it.
         self.heading_hold = False
         self.heading_target = 0.0
         self.lateral_target = 0.0
@@ -198,8 +210,17 @@ class G1Sim:
         # Rendering (model/renderer created lazily in the render thread).
         self.render_model = None
         self.render_data = None
-        self._render_maps_built = False
         self.overlay_arm_pose = "carry"  # preset name OR {joint: angle} dict
+        self.spraying = False            # fire scene: water jet on/off
+        self.jet_speed = 7.0             # m/s muzzle speed of the water
+        self.aim_pitch = NOZZLE_REST_PITCH   # fixed nozzle elevation (no auto-aim)
+        self.fire_health = 1.0           # 1 = burning, 0 = extinguished
+        self._hitting = False            # is the jet currently on the fire?
+        self.fx = None                   # effects.SceneFX (fire scene only)
+        self._hose_bid = -1
+        self._water = None               # cached per-frame jet path (for ego view)
+        self._water_landing = None
+        self._water_hit_idx = None
         self.renderer = None
         self.cam = mujoco.MjvCamera()
         self.cam.distance = 3.0
@@ -255,6 +276,16 @@ class G1Sim:
                 pass
         return self.overlay_arm_pose
 
+    def set_spray(self, on=None):
+        """Toggle (or set) the water jet (fire scene only). Returns the state."""
+        self.spraying = (not self.spraying) if on is None else bool(on)
+        return self.spraying
+
+    def reignite(self):
+        """Restore the fire to full health (for repeated demo runs)."""
+        self.fire_health = 1.0
+        return self.fire_health
+
     @property
     def arm_pose_label(self) -> str:
         """Short label for the active pose (preset name, or 'custom')."""
@@ -272,6 +303,9 @@ class G1Sim:
             "fell": self._fell,
             "sim_time": self.data.time,
             "arm_pose": self.arm_pose_label if self.overlay_scene else None,
+            "spraying": self.spraying,
+            "hitting": self._hitting,
+            "fire_health": self.fire_health,
         }
 
     # -- robot ego camera ---------------------------------------------------- #
@@ -314,12 +348,9 @@ class G1Sim:
         grav = gravity_orientation(quat)
         omega = omega * self.ang_vel_scale
 
-        # NOTE: this blind policy balances *by* stepping -- at zero command it
-        # marks time in place (~3-4 cm foot lift). Freezing or damping the gait
-        # to plant the feet makes it drift or fall (verified), so we keep the
-        # gait clock advancing. A true planted stand needs the trained
-        # stand-capable policy (see train_5090/). Idle station-keeping is
-        # available via heading_hold to stop any positional wander.
+        # The blind policy balances *by* stepping (it marks time at zero
+        # command); freezing the gait makes it drift/fall, so the clock always
+        # advances. heading_hold cancels positional wander.
         period = 0.8
         t = self.counter * self.sim_dt
         phase = (t % period) / period
@@ -349,18 +380,20 @@ class G1Sim:
         JNT = mujoco.mjtObj.mjOBJ_JOINT
         nid = lambda n: mujoco.mj_name2id(m, JNT, n)
         self._render_leg_qadr = np.array([m.jnt_qposadr[nid(n)] for n in LEG_JOINTS])
-        leg_set = set(LEG_JOINTS)
+        # The nozzle joint is driven separately (aim), not by arm presets.
+        skip = set(LEG_JOINTS) | {NOZZLE_JOINT}
         self._render_aux_names, qadr = [], []
         for i in range(m.njnt):
             if m.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE:
                 continue
             name = mujoco.mj_id2name(m, JNT, i)
-            if name in leg_set:
+            if name in skip:
                 continue
             self._render_aux_names.append(name)
             qadr.append(m.jnt_qposadr[i])
         self._render_aux_qadr = np.array(qadr, dtype=int)
-        self._render_maps_built = True
+        nid_noz = nid(NOZZLE_JOINT)
+        self._nozzle_qadr = m.jnt_qposadr[nid_noz] if nid_noz >= 0 else -1
 
     def _init_render_model(self):
         """Build the 29-DOF overlay model with a torso-mounted ego camera, and
@@ -390,6 +423,50 @@ class G1Sim:
             self.render_model, mujoco.mjtObj.mjOBJ_CAMERA, "ego")
         if self.ego_cam_id >= 0:
             self.cam_renderer = mujoco.Renderer(self.render_model, CAM_H, CAM_W)
+        self._hose_bid = mujoco.mj_name2id(
+            self.render_model, mujoco.mjtObj.mjOBJ_BODY, "hose")
+        self.fx = effects.SceneFX(self.render_model)
+
+    def _muzzle_world(self):
+        """Nozzle muzzle world ``(position, unit_direction)``, or ``None``. The
+        direction is the real barrel axis, so the jet goes where the nozzle
+        points. Call after the overlay kinematics are forwarded."""
+        if self._hose_bid < 0:
+            return None
+        rd = self.render_data
+        rot = rd.xmat[self._hose_bid].reshape(3, 3)
+        d_local = np.array([math.sin(HOSE_BARREL_TILT), 0.0, math.cos(HOSE_BARREL_TILT)])
+        direction = rot @ d_local
+        pos = rd.xpos[self._hose_bid] + direction * NOZZLE_REACH
+        return pos, direction / (np.linalg.norm(direction) + 1e-9)
+
+    def _update_jet(self):
+        """Per-frame water ballistics, hit test and extinguish progress (fire
+        scene only). Caches the jet path so the ego view draws the same arc. The
+        nozzle sits at a fixed elevation -- there is no closed-loop aiming here;
+        that's the fire controller's job (still a stub)."""
+        self._water = self._water_landing = self._water_hit_idx = None
+        self._hitting = False
+        if not (self.fx and self.fx.active and self.spraying):
+            return
+        mz = self._muzzle_world()
+        if mz is None:
+            return
+        muzzle, direction = mz
+        pts, landing = effects.trajectory(muzzle, direction, self.jet_speed)
+        center = np.asarray(scenes.FIRE_POSITION_WORLD, float) + [0, 0, FIRE_AIM_HEIGHT]
+        idx, hit, _ = effects.hit_index(pts, center, HIT_RADIUS)
+        self._water, self._water_landing, self._water_hit_idx = pts, landing, idx
+        self._hitting = hit = hit and self.fire_health > 0.0
+        if hit:
+            self.fire_health = max(
+                0.0, self.fire_health - 1.0 / (EXTINGUISH_TIME * RENDER_FPS))
+
+    def _decorate(self, scene):
+        self.fx.decorate(scene, fire_pos=scenes.FIRE_POSITION_WORLD,
+                         water=self._water, landing=self._water_landing,
+                         hit_idx=self._water_hit_idx, hitting=self._hitting,
+                         health=self.fire_health)
 
     def render_once(self):
         """Render the current frame to the shared frame buffer. Must run on the
@@ -404,9 +481,14 @@ class G1Sim:
             targets = arms.resolve_pose(self.overlay_arm_pose, self._render_aux_names)
             for name, adr in zip(self._render_aux_names, self._render_aux_qadr):
                 rd.qpos[adr] = targets[name]
+            if self._nozzle_qadr >= 0:
+                rd.qpos[self._nozzle_qadr] = self.aim_pitch
+            self.fx.animate(self.render_model, self.fire_health)
             mujoco.mj_forward(self.render_model, rd)
+            self._update_jet()
             self.cam.lookat[:] = rd.qpos[0:3]
             self.renderer.update_scene(rd, self.cam)
+            self._decorate(self.renderer.scene)
         else:
             if self.renderer is None:
                 self.renderer = mujoco.Renderer(self.model, RENDER_H, RENDER_W)
@@ -420,6 +502,7 @@ class G1Sim:
         if self.cam_renderer is None or self.ego_cam_id < 0:
             return
         self.cam_renderer.update_scene(self.render_data, camera=self.ego_cam_id)
+        self._decorate(self.cam_renderer.scene)
         rgb = self.cam_renderer.render()
         self._last_cam_rgb = rgb
         self.cam_frames.set(encode_jpeg(rgb))
@@ -539,6 +622,8 @@ kbd{background:#333;padding:1px 5px;border-radius:3px}</style></head>
 <kbd>Q</kbd>/<kbd>E</kbd> strafe &nbsp; <kbd>Space</kbd> stop<br>
 <kbd>H</kbd> auto-steer (re-center) <span id="hh"></span><br>
 <kbd>1</kbd> carry hose &nbsp; <kbd>2</kbd> aim &nbsp; <kbd>3</kbd> arms down &nbsp; arms: <span id="arm">?</span><br>
+<kbd>F</kbd> spray water <span id="spray">[off]</span> &nbsp; <kbd>G</kbd> reignite<br>
+fire: <span id="fire">100%</span> <span id="hit"></span><br>
 cmd: <span id="cmd">0,0,0</span><br>
 <span id="st"></span>
 </div>
@@ -561,6 +646,9 @@ document.addEventListener('keydown',e=>{
       document.getElementById('hh').textContent=d.heading_hold?'[ON]':'[off]';});return;
     case'1':setArm('carry');return; case'2':setArm('aim');return;
     case'3':setArm('down');return;
+    case'f':fetch('/spray').then(r=>r.json()).then(d=>{
+      document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';});return;
+    case'g':fetch('/reignite');return;
     default:return;}
   send();});
 document.addEventListener('keyup',e=>{
@@ -571,6 +659,10 @@ document.addEventListener('keyup',e=>{
   send();});
 setInterval(()=>{fetch('/state').then(r=>r.json()).then(d=>{
   if(d.arm_pose)document.getElementById('arm').textContent=d.arm_pose;
+  document.getElementById('spray').textContent=d.spraying?'[ON]':'[off]';
+  document.getElementById('fire').textContent=Math.round(d.fire_health*100)+'%';
+  document.getElementById('hit').textContent=
+    d.fire_health<=0?'\u2713 OUT':(d.spraying?(d.hitting?'\u25c9 HIT':'\u2715 MISS'):'');
   document.getElementById('st').textContent=
     `pos ${d.pos.map(x=>x.toFixed(2))} ${d.fell?'\u26a0 FELL':'ok'}`;});},500);
 </script></body></html>"""
@@ -599,6 +691,16 @@ def _make_app(sim: G1Sim):
             return jsonify(arm_pose=sim.set_overlay_arm_pose(
                 request.args.get("pose", "carry")))
 
+        @app.route("/spray")
+        def spray():
+            on = request.args.get("on")
+            return jsonify(spraying=sim.set_spray(
+                None if on is None else on not in ("0", "false", "")))
+
+        @app.route("/reignite")
+        def reignite():
+            return jsonify(fire_health=sim.reignite())
+
         if sim.has_camera:
             @app.route("/camera")
             def camera():
@@ -608,7 +710,8 @@ def _make_app(sim: G1Sim):
         s = sim.get_state()
         return dict(pos=s["pos"].tolist(), cmd=s["cmd"].tolist(),
                     fell=bool(s["fell"]), sim_time=float(s["sim_time"]),
-                    arm_pose=s["arm_pose"])
+                    arm_pose=s["arm_pose"], spraying=bool(s["spraying"]),
+                    hitting=bool(s["hitting"]), fire_health=float(s["fire_health"]))
 
     ego = ('<div id="ego"><div class="lbl">ROBOT CAM</div>'
            '<img src="/camera"/></div>') if sim.has_camera else ""

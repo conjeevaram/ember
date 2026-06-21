@@ -7,7 +7,7 @@ Environment variables
 External repos (cloned separately; see README):
     UNITREE_RL_GYM   path to unitree_rl_gym   (default: ~/unitree_rl_gym)
 
-Video stream (applies to both demos):
+Video stream:
     EMBER_W, EMBER_H     frame size           (default: 640x360)
     EMBER_FPS            stream framerate      (default: 18)
     EMBER_QUALITY        JPEG quality 1-95     (default: 55)

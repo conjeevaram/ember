@@ -1,6 +1,6 @@
-"""Headless MJPEG streaming and the shared Flask scaffolding both demos use.
+"""Headless MJPEG streaming and the shared Flask scaffolding for the demo.
 
-A demo renders frames on its own thread (which owns the EGL/GL context) and
+The sim renders frames on its own thread (which owns the EGL/GL context) and
 publishes the latest JPEG into a :class:`FrameBuffer`. The web app only ever
 reads that buffer, so it never touches MuJoCo -- keeping the physics/render and
 HTTP concerns cleanly separated.
